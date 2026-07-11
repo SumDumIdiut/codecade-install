@@ -250,6 +250,7 @@ PORTAL_PACKAGE_JSON
   cat > "$DIR/portal/server.js" <<'PORTAL_SERVER_JS'
 const express = require('express');
 const http = require('http');
+const net = require('net');
 const path = require('path');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 
@@ -275,10 +276,17 @@ const forgeProxy = createProxyMiddleware({
   changeOrigin: true,
   logLevel: 'warn',
 });
+// Plain HTTP only here (no ws:true) -- WS upgrades for /tag are handled by
+// proxyTagWebSocket below instead, via a raw socket pipe. http-proxy-
+// middleware's own WS handling corrupts every frame under this exact setup
+// (confirmed live: connecting straight to relay-server works fine, but any
+// connection through this middleware's ws:true path fails immediately with
+// "Invalid WebSocket frame: RSV1 must be clear" -- with no compression
+// extension even negotiated in the handshake, so it isn't a permessage-
+// deflate issue, just something mechanically wrong in how it pipes frames).
 const tagRelayProxy = createProxyMiddleware({
   target: TAG_RELAY_TARGET,
   changeOrigin: true,
-  ws: true, // /tag/relay/host, /relay/data/:token, /relay/join/:id are all WS upgrades
   logLevel: 'warn',
 });
 
@@ -289,11 +297,32 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
 
+// Manual raw TCP pipe for /tag's WebSocket upgrades (see comment above the
+// tagRelayProxy - the relay's own player<->host splice() does the exact
+// same kind of pure byte-forwarding, which is what makes this reliable:
+// no WS-frame-aware reparsing anywhere in the path to get wrong.
+function proxyTagWebSocket(req, socket, head) {
+  const target = new URL(TAG_RELAY_TARGET);
+  const targetSocket = net.connect(target.port || 80, target.hostname, () => {
+    let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
+    }
+    raw += '\r\n';
+    targetSocket.write(raw);
+    if (head && head.length) targetSocket.write(head);
+    targetSocket.pipe(socket);
+    socket.pipe(targetSocket);
+  });
+  targetSocket.on('error', () => socket.destroy());
+  socket.on('error', () => targetSocket.destroy());
+}
+
 // Express only handles regular HTTP requests — WebSocket upgrades on the raw
 // server have to be routed to the matching proxy instance by hand.
 server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith('/temutalk')) return temutalkProxy.upgrade(req, socket, head);
-  if (req.url.startsWith('/tag')) return tagRelayProxy.upgrade(req, socket, head);
+  if (req.url.startsWith('/tag')) return proxyTagWebSocket(req, socket, head);
   socket.destroy();
 });
 
