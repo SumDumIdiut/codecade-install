@@ -1214,8 +1214,7 @@ async function refreshAdmin(){
         '<div class="stat-chip">&#128421; '+esc(sys.hostname)+'</div>'+
         '<div class="stat-chip">&#9201; up '+fmtUp(sys.uptime)+'</div>'+
         '<div class="stat-chip"><div class="dot" style="background:'+loadColor+'"></div>load '+load+'</div>'+
-        '<div class="stat-chip">RAM '+sys.memPct+'%</div>'+
-        (adminData.ffmpegRunning?'<div class="stat-chip"><div class="dot dot-grn"></div>Casting</div>':'');
+        '<div class="stat-chip">RAM '+sys.memPct+'%</div>';
     }
     var n=(adminData.connectedDevices||[]).length;
     var badge=document.getElementById('dev-badge');
