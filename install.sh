@@ -141,6 +141,11 @@ snapshot_log_on_failure() {
   err "$label failed — check $logfile (snapshot: $dest)"
 }
 
+update_checkout_hard() {
+  local dir="$1"
+  git_safe "$dir" fetch --quiet origin main && git_safe "$dir" reset --quiet --hard origin/main
+}
+
 # ─── Clone / update the two app repos ───────────────────────────────────────
 clone_or_update() {
   local dir="$1" url="$2" name="$3"
@@ -151,8 +156,15 @@ clone_or_update() {
   # re-clone instead of failing `pull` forever with no way to self-heal.
   if [ -d "$dir/.git" ] && git_safe "$dir" rev-parse HEAD >/dev/null 2>&1; then
     info "Updating $name..."
-    run_capturing "pull-$name" git_safe "$dir" pull --ff-only \
-      || warn "$name: git pull failed — continuing with existing checkout (see errors/ for details)"
+    # fetch + reset --hard, not `pull`: these checkouts are entirely
+    # auto-managed (nothing should ever hand-edit them), but things like the
+    # CRLF-strip defense below DO edit temutalk/install.sh's working tree in
+    # place -- a plain `pull --ff-only` then refuses forever with "local
+    # changes would be overwritten by merge" the moment that happens once.
+    # Discarding local changes on every update is the correct, idempotent
+    # behavior here, not a risk.
+    run_capturing "pull-$name" update_checkout_hard "$dir" \
+      || warn "$name: git update failed — continuing with existing checkout (see errors/ for details)"
   else
     if [ -d "$dir/.git" ]; then
       warn "$name: existing checkout looks corrupted (no valid HEAD) — removing and re-cloning."
