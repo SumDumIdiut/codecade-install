@@ -9,10 +9,16 @@
 #   bash install.sh                first run: clone, install, setup, then TUI
 #   bash install.sh start all      non-interactive start (used by the TUI itself)
 #   bash install.sh status         JSON status snapshot
+#   bash install.sh errors         list recorded errors (also in the errors/ folder)
 #   bash install.sh bundle <dest>  copy install.sh + all repos to <dest> (e.g. a
 #                                   mounted USB drive) so it can be plugged into
 #                                   any machine and run without needing network
 #                                   access to re-clone from GitHub
+#
+# Every failure (failed clone/npm-install/service-start) is recorded verbosely
+# under errors/ — a running errors/errors.log transcript, plus a full-output
+# snapshot file per failure — so nothing is lost even if nobody was watching
+# the terminal when it broke.
 
 set -uo pipefail
 
@@ -38,7 +44,14 @@ fi
 ok()   { echo "  ${C_GREEN}✓${C_RESET} $1"; }
 info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
 warn() { echo "  ${C_YELLOW}!${C_RESET} $1"; }
-err()  { echo "  ${C_RED}✗${C_RESET} $1"; }
+# Every err() call is also appended to errors/errors.log with a timestamp —
+# applies automatically to every existing call site, no need to touch them.
+# For failures worth capturing full command output (not just the one-line
+# message), see run_capturing() below.
+err()  {
+  echo "  ${C_RED}✗${C_RESET} $1"
+  printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >> "$DIR/errors/errors.log" 2>/dev/null
+}
 
 # ─── Self-update ──────────────────────────────────────────────────────────
 # Runs before anything else on every startup (interactive or CLI dispatch)
@@ -85,7 +98,37 @@ self_update() {
 }
 self_update "$@"
 
-mkdir -p logs .run
+mkdir -p logs .run errors
+
+# Runs a command with combined stdout+stderr captured. On failure, saves the
+# full output to a timestamped file under errors/ (referenced from the
+# one-line err() message) instead of just letting it scroll past in the
+# terminal — the detail survives even if you weren't watching when it broke.
+run_capturing() {
+  local label="$1"; shift
+  local out; out="$(mktemp 2>/dev/null)" || { "$@"; return $?; }
+  if "$@" > "$out" 2>&1; then
+    rm -f "$out"
+    return 0
+  else
+    local code=$?
+    local dest="errors/$(date -u +%Y%m%d-%H%M%S)-${label}.log"
+    mv "$out" "$dest" 2>/dev/null || cp "$out" "$dest" 2>/dev/null
+    err "$label failed — full output: $dest"
+    return "$code"
+  fi
+}
+
+# Snapshots the tail of a running service's log into errors/ at the moment a
+# start failure is detected, so the failure context survives even after the
+# log file keeps growing / gets rotated later.
+snapshot_log_on_failure() {
+  local label="$1" logfile="$2"
+  [ -f "$logfile" ] || return
+  local dest="errors/$(date -u +%Y%m%d-%H%M%S)-${label}.log"
+  tail -n 80 "$logfile" > "$dest" 2>/dev/null
+  err "$label failed — check $logfile (snapshot: $dest)"
+}
 
 # ─── Clone / update the two app repos ───────────────────────────────────────
 clone_or_update() {
@@ -95,8 +138,11 @@ clone_or_update() {
     git -C "$dir" pull --ff-only || warn "$name: git pull failed — continuing with existing checkout"
   else
     info "Cloning $name..."
-    git clone "$url" "$dir" || { err "Clone of $name failed. Check your internet connection / git installation."; exit 1; }
-    ok "$name cloned."
+    if run_capturing "clone-$name" git clone "$url" "$dir"; then
+      ok "$name cloned."
+    else
+      exit 1
+    fi
   fi
 }
 
@@ -305,17 +351,17 @@ do_setup() {
   fi
 
   info "Installing portal dependencies..."
-  ( cd "$DIR/portal" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
-    && ok "Portal dependencies installed." || err "Portal npm install failed."
+  run_capturing "portal-npm-install" bash -c "cd '$DIR/portal' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+    && ok "Portal dependencies installed."
 
   info "Installing git-forge dependencies..."
-  ( cd "$DIR/git-forge" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
-    && ok "git-forge dependencies installed." || err "git-forge npm install failed."
+  run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+    && ok "git-forge dependencies installed."
 
   if [ -d "$DIR/tag/relay-server" ]; then
     info "Installing tag relay-server dependencies..."
-    ( cd "$DIR/tag/relay-server" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
-      && ok "tag relay-server dependencies installed." || err "tag relay-server npm install failed."
+    run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+      && ok "tag relay-server dependencies installed."
   else
     warn "tag/relay-server not found in the tag repo checkout — skipping."
   fi
@@ -385,7 +431,7 @@ start_forge() {
     nohup "$node_bin" server.js > "$DIR/logs/forge.log" 2>&1 & echo $! > "$(pid_file forge)" )
   sleep 1
   if proc_running forge; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
-  else err "git-forge failed to start — check logs/forge.log"; fi
+  else snapshot_log_on_failure "forge-start" "$DIR/logs/forge.log"; fi
 }
 
 start_tag_relay() {
@@ -397,7 +443,7 @@ start_tag_relay() {
     nohup "$node_bin" server.js > "$DIR/logs/tag-relay.log" 2>&1 & echo $! > "$(pid_file tag-relay)" )
   sleep 1
   if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
-  else err "tag relay-server failed to start — check logs/tag-relay.log"; fi
+  else snapshot_log_on_failure "tag-relay-start" "$DIR/logs/tag-relay.log"; fi
 }
 
 start_temutalk() {
@@ -409,7 +455,7 @@ start_temutalk() {
     nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo $! > "$(pid_file temutalk)" )
   sleep 2
   if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
-  else err "temutalk failed to start — check logs/temutalk.log"; fi
+  else snapshot_log_on_failure "temutalk-start" "$DIR/logs/temutalk.log"; fi
 }
 
 start_portal() {
@@ -422,7 +468,7 @@ start_portal() {
     nohup "$node_bin" server.js > "$DIR/logs/portal.log" 2>&1 & echo $! > "$(pid_file portal)" )
   sleep 1
   if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
-  else err "Portal failed to start — check logs/portal.log"; fi
+  else snapshot_log_on_failure "portal-start" "$DIR/logs/portal.log"; fi
 }
 
 # Reuses temutalk's existing tunnel credentials in temutalk/.cloudflared/, but
@@ -480,7 +526,7 @@ EOF
   echo $! > "$(pid_file tunnel)"
   sleep 2
   if proc_running tunnel; then ok "Tunnel started (PID $(proc_pid tunnel)) → https://${CF_DOMAIN}"
-  else err "Tunnel failed to start — check logs/tunnel.log"; fi
+  else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
 }
 
 do_start() { start_forge; start_tag_relay; start_temutalk; start_portal; start_tunnel; }
@@ -514,8 +560,8 @@ do_check_updates() {
   clone_or_update tag "$TAG_REPO" tag
   local npm_bin; npm_bin=$(find_npm)
   if [ -n "$npm_bin" ]; then
-    ( cd "$DIR/git-forge" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) >/dev/null 2>&1
-    [ -d "$DIR/tag/relay-server" ] && ( cd "$DIR/tag/relay-server" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) >/dev/null 2>&1
+    run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --loglevel=error"
+    [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --loglevel=error"
   fi
   read -rp "  Restart running services to apply? [Y/n] " yn
   if [[ ! "$yn" =~ ^[Nn]$ ]]; then
@@ -531,8 +577,23 @@ do_check_updates() {
 do_view_logs() {
   echo "  ${C_DIM}Ctrl+C to return to the menu.${C_RESET}"
   sleep 1
-  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log
-  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log
+  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log errors/errors.log
+  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log errors/errors.log
+}
+
+do_view_errors() {
+  local n; n=$(find errors -maxdepth 1 -type f 2>/dev/null | wc -l)
+  if [ "$n" -eq 0 ]; then
+    warn "No errors recorded yet."
+    return
+  fi
+  echo "  ${C_BOLD}errors/${C_RESET} ($n file(s))"
+  ls -1t errors | sed 's/^/    /'
+  echo ""
+  if [ -f errors/errors.log ]; then
+    echo "  ${C_DIM}Last 20 entries in errors.log:${C_RESET}"
+    tail -n 20 errors/errors.log | sed 's/^/    /'
+  fi
 }
 
 # ─── Non-interactive CLI dispatch ────────────────────────────────────────────
@@ -560,6 +621,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   exit 0
 fi
 if [ "${1:-}" = "status" ]; then status_json; exit 0; fi
+if [ "${1:-}" = "errors" ]; then do_view_errors; exit 0; fi
 
 # ─── First-run setup, then TUI ───────────────────────────────────────────────
 echo ""
@@ -579,6 +641,7 @@ MENU_LABELS=(
   "Open in browser"
   "Check for updates"
   "View logs"
+  "View errors"
   "Toggle Forge"
   "Toggle TemuTalk"
   "Toggle Portal"
@@ -649,6 +712,10 @@ menu() {
     if [ "$_updates_available" -eq 1 ]; then
       echo "  ${C_YELLOW}Updates available — select \"Check for updates\" to pull.${C_RESET}"
     fi
+    local _err_count; _err_count=$(find errors -maxdepth 1 -type f 2>/dev/null | wc -l)
+    if [ "$_err_count" -gt 0 ]; then
+      echo "  ${C_RED}$_err_count error file(s) recorded — select \"View errors\".${C_RESET}"
+    fi
     echo ""
     echo "  ${C_DIM}↑/↓ to move, Enter to select${C_RESET}"
     echo ""
@@ -690,16 +757,17 @@ menu() {
       2) do_open_browser ;;
       3) do_check_updates ;;
       4) do_view_logs ;;
-      5) if proc_running forge;     then stop_proc forge;     else start_forge;     fi ;;
-      6) if proc_running temutalk;  then stop_proc temutalk;  else start_temutalk;  fi ;;
-      7) if proc_running portal;    then stop_proc portal;    else start_portal;    fi ;;
-      8) if proc_running tunnel;    then stop_proc tunnel;    else start_tunnel;    fi ;;
-      9) if proc_running tag-relay; then stop_proc tag-relay; else start_tag_relay; fi ;;
-      10)
+      5) do_view_errors ;;
+      6) if proc_running forge;     then stop_proc forge;     else start_forge;     fi ;;
+      7) if proc_running temutalk;  then stop_proc temutalk;  else start_temutalk;  fi ;;
+      8) if proc_running portal;    then stop_proc portal;    else start_portal;    fi ;;
+      9) if proc_running tunnel;    then stop_proc tunnel;    else start_tunnel;    fi ;;
+      10) if proc_running tag-relay; then stop_proc tag-relay; else start_tag_relay; fi ;;
+      11)
         read -rp "  Destination path (e.g. a mounted USB drive): " bundle_dest
         [ -n "$bundle_dest" ] && do_bundle "$bundle_dest"
         ;;
-      11)
+      12)
         echo "  Bye."
         exit 0
         ;;
