@@ -40,6 +40,51 @@ info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
 warn() { echo "  ${C_YELLOW}!${C_RESET} $1"; }
 err()  { echo "  ${C_RED}✗${C_RESET} $1"; }
 
+# ─── Self-update ──────────────────────────────────────────────────────────
+# Runs before anything else on every startup (interactive or CLI dispatch)
+# so this is always the latest version, whether it's a real clone of
+# codecade-install (git pull) or a standalone file someone curl'd down
+# (re-fetch the raw file and replace it if different). Silent/non-fatal if
+# offline or the update itself fails — never blocks the rest of the script.
+CODECADE_INSTALL_RAW_URL="https://raw.githubusercontent.com/SumDumIdiut/codecade-install/main/install.sh"
+self_update() {
+  [ -n "${_CODECADE_SELF_UPDATED:-}" ] && return
+
+  if [ -d "$DIR/.git" ] && git -C "$DIR" remote get-url origin 2>/dev/null | grep -q "codecade-install"; then
+    local before after
+    before=$(git -C "$DIR" rev-parse HEAD 2>/dev/null) || return
+    git -C "$DIR" fetch --quiet origin main 2>/dev/null || return
+    after=$(git -C "$DIR" rev-parse origin/main 2>/dev/null) || return
+    if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+      info "Updating install.sh..."
+      if git -C "$DIR" reset --quiet --hard origin/main 2>/dev/null; then
+        ok "install.sh updated — restarting."
+        _CODECADE_SELF_UPDATED=1 exec bash "$DIR/install.sh" "$@"
+      else
+        warn "install.sh self-update failed — continuing with the current version."
+      fi
+    fi
+  else
+    command -v curl >/dev/null 2>&1 || return
+    local tmp; tmp="$(mktemp 2>/dev/null)" || return
+    if curl -fsSL --max-time 5 "$CODECADE_INSTALL_RAW_URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] && bash -n "$tmp" 2>/dev/null; then
+      if ! cmp -s "$tmp" "$DIR/install.sh"; then
+        info "Updating install.sh..."
+        if cp "$tmp" "$DIR/install.sh" 2>/dev/null; then
+          chmod +x "$DIR/install.sh" 2>/dev/null
+          rm -f "$tmp"
+          ok "install.sh updated — restarting."
+          _CODECADE_SELF_UPDATED=1 exec bash "$DIR/install.sh" "$@"
+        else
+          warn "install.sh self-update failed (couldn't write) — continuing with the current version."
+        fi
+      fi
+    fi
+    rm -f "$tmp" 2>/dev/null
+  fi
+}
+self_update "$@"
+
 mkdir -p logs .run
 
 # ─── Clone / update the two app repos ───────────────────────────────────────
