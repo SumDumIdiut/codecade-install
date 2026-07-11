@@ -216,8 +216,10 @@ write_portal_files() {
     "express": "^4.18.2",
     "http-proxy-middleware": "^2.0.6",
     "ws": "^8.14.2",
-    "node-pty": "^1.1.0",
     "selfsigned": "^2.4.1"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
   }
 }
 PORTAL_PACKAGE_JSON
