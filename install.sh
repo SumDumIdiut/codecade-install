@@ -149,7 +149,12 @@ snapshot_log_on_failure() {
 
 update_checkout_hard() {
   local dir="$1"
-  git_safe "$dir" fetch --quiet origin main && git_safe "$dir" reset --quiet --hard origin/main
+  # Don't hardcode a branch name -- git-forge's default branch is "master",
+  # temutalk/tag use "main". Whatever branch `git clone` originally checked
+  # out is what HEAD already points at, so read that back instead of
+  # guessing (this broke git-forge updates: "couldn't find remote ref main").
+  local branch; branch=$(git_safe "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
+  git_safe "$dir" fetch --quiet origin "$branch" && git_safe "$dir" reset --quiet --hard "origin/$branch"
 }
 
 # ─── Clone / update the two app repos ───────────────────────────────────────
@@ -2101,12 +2106,15 @@ check_for_updates_quiet() {
   [ $(( now - _last_update_check )) -lt "$UPDATE_CHECK_INTERVAL_SEC" ] && return
   _last_update_check=$now
   _updates_available=0
-  local name local_sha remote_sha
+  local name branch local_sha remote_sha
   for name in temutalk git-forge tag; do
     [ -d "$DIR/$name/.git" ] || continue
-    git_safe "$DIR/$name" fetch --quiet origin main 2>/dev/null || continue
+    # git-forge's default branch is "master", temutalk/tag use "main" --
+    # read HEAD's branch back instead of assuming (see update_checkout_hard).
+    branch=$(git_safe "$DIR/$name" rev-parse --abbrev-ref HEAD 2>/dev/null) || continue
+    git_safe "$DIR/$name" fetch --quiet origin "$branch" 2>/dev/null || continue
     local_sha=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
-    remote_sha=$(git_safe "$DIR/$name" rev-parse origin/main 2>/dev/null)
+    remote_sha=$(git_safe "$DIR/$name" rev-parse "origin/$branch" 2>/dev/null)
     [ -n "$local_sha" ] && [ -n "$remote_sha" ] && [ "$local_sha" != "$remote_sha" ] && _updates_available=1
   done
 }
