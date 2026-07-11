@@ -134,10 +134,20 @@ snapshot_log_on_failure() {
 # ─── Clone / update the two app repos ───────────────────────────────────────
 clone_or_update() {
   local dir="$1" url="$2" name="$3"
-  if [ -d "$dir/.git" ]; then
+  # A directory can end up with a ".git" folder that isn't actually a usable
+  # repo -- e.g. an interrupted copy to another drive that pre-created the
+  # file tree before writing any content. rev-parse HEAD is a cheap way to
+  # tell "real checkout" from "hollow shell"; treat the latter as absent and
+  # re-clone instead of failing `pull` forever with no way to self-heal.
+  if [ -d "$dir/.git" ] && git -C "$dir" rev-parse HEAD >/dev/null 2>&1; then
     info "Updating $name..."
-    git -C "$dir" pull --ff-only || warn "$name: git pull failed — continuing with existing checkout"
+    run_capturing "pull-$name" git -C "$dir" pull --ff-only \
+      || warn "$name: git pull failed — continuing with existing checkout (see errors/ for details)"
   else
+    if [ -d "$dir/.git" ]; then
+      warn "$name: existing checkout looks corrupted (no valid HEAD) — removing and re-cloning."
+      rm -rf "$dir"
+    fi
     info "Cloning $name..."
     if run_capturing "clone-$name" git clone "$url" "$dir"; then
       ok "$name cloned."
