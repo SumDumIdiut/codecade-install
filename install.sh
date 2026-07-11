@@ -35,6 +35,16 @@ FORGE_PORT="${FORGE_PORT:-3000}"
 TAG_RELAY_PORT="${TAG_RELAY_PORT:-3002}"
 DEV_PANEL_PORT="${DEV_PANEL_PORT:-9091}"
 
+# Runs a git command against a repo dir that might live on a filesystem
+# without ownership tracking (FAT/exFAT USB drives, common for the bundled
+# copy this script is designed to run from) -- git refuses those with
+# "detected dubious ownership" otherwise. Scoped to just this invocation via
+# -c, never touches the user's persistent gitconfig.
+git_safe() {
+  local dir="$1"; shift
+  git -c safe.directory="$dir" -C "$dir" "$@"
+}
+
 # ─── Colour helpers (matches temutalk/install.sh) ───────────────────────────
 if [ -t 1 ]; then
   C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
@@ -64,14 +74,14 @@ CODECADE_INSTALL_RAW_URL="https://raw.githubusercontent.com/SumDumIdiut/codecade
 self_update() {
   [ -n "${_CODECADE_SELF_UPDATED:-}" ] && return
 
-  if [ -d "$DIR/.git" ] && git -C "$DIR" remote get-url origin 2>/dev/null | grep -q "codecade-install"; then
+  if [ -d "$DIR/.git" ] && git_safe "$DIR" remote get-url origin 2>/dev/null | grep -q "codecade-install"; then
     local before after
-    before=$(git -C "$DIR" rev-parse HEAD 2>/dev/null) || return
-    git -C "$DIR" fetch --quiet origin main 2>/dev/null || return
-    after=$(git -C "$DIR" rev-parse origin/main 2>/dev/null) || return
+    before=$(git_safe "$DIR" rev-parse HEAD 2>/dev/null) || return
+    git_safe "$DIR" fetch --quiet origin main 2>/dev/null || return
+    after=$(git_safe "$DIR" rev-parse origin/main 2>/dev/null) || return
     if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
       info "Updating install.sh..."
-      if git -C "$DIR" reset --quiet --hard origin/main 2>/dev/null; then
+      if git_safe "$DIR" reset --quiet --hard origin/main 2>/dev/null; then
         ok "install.sh updated — restarting."
         _CODECADE_SELF_UPDATED=1 exec bash "$DIR/install.sh" "$@"
       else
@@ -139,9 +149,9 @@ clone_or_update() {
   # file tree before writing any content. rev-parse HEAD is a cheap way to
   # tell "real checkout" from "hollow shell"; treat the latter as absent and
   # re-clone instead of failing `pull` forever with no way to self-heal.
-  if [ -d "$dir/.git" ] && git -C "$dir" rev-parse HEAD >/dev/null 2>&1; then
+  if [ -d "$dir/.git" ] && git_safe "$dir" rev-parse HEAD >/dev/null 2>&1; then
     info "Updating $name..."
-    run_capturing "pull-$name" git -C "$dir" pull --ff-only \
+    run_capturing "pull-$name" git_safe "$dir" pull --ff-only \
       || warn "$name: git pull failed — continuing with existing checkout (see errors/ for details)"
   else
     if [ -d "$dir/.git" ]; then
@@ -2063,9 +2073,9 @@ check_for_updates_quiet() {
   local name local_sha remote_sha
   for name in temutalk git-forge tag; do
     [ -d "$DIR/$name/.git" ] || continue
-    git -C "$DIR/$name" fetch --quiet origin main 2>/dev/null || continue
-    local_sha=$(git -C "$DIR/$name" rev-parse HEAD 2>/dev/null)
-    remote_sha=$(git -C "$DIR/$name" rev-parse origin/main 2>/dev/null)
+    git_safe "$DIR/$name" fetch --quiet origin main 2>/dev/null || continue
+    local_sha=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
+    remote_sha=$(git_safe "$DIR/$name" rev-parse origin/main 2>/dev/null)
     [ -n "$local_sha" ] && [ -n "$remote_sha" ] && [ "$local_sha" != "$remote_sha" ] && _updates_available=1
   done
 }
