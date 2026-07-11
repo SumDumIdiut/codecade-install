@@ -1709,17 +1709,23 @@ do_setup() {
     exit 1
   fi
 
+  # --no-bin-links: this whole tree is designed to run from a portable USB
+  # drive, which is usually exFAT/FAT32 for cross-OS compatibility -- those
+  # filesystems can't hold symlinks at all, and npm's node_modules/.bin
+  # wrapper scripts are symlinks. None of these apps are started via a
+  # package.json bin script (all launched as `node server.js` directly), so
+  # skipping bin-link creation costs nothing and avoids EPERM on install.
   info "Installing portal dependencies..."
-  run_capturing "portal-npm-install" bash -c "cd '$DIR/portal' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+  run_capturing "portal-npm-install" bash -c "cd '$DIR/portal' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
     && ok "Portal dependencies installed."
 
   info "Installing git-forge dependencies..."
-  run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+  run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
     && ok "git-forge dependencies installed."
 
   if [ -d "$DIR/tag/relay-server" ]; then
     info "Installing tag relay-server dependencies..."
-    run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --loglevel=error" \
+    run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
       && ok "tag relay-server dependencies installed."
   else
     warn "tag/relay-server not found in the tag repo checkout — skipping."
@@ -1942,8 +1948,8 @@ do_check_updates() {
   clone_or_update tag "$TAG_REPO" tag
   local npm_bin; npm_bin=$(find_npm)
   if [ -n "$npm_bin" ]; then
-    run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --loglevel=error"
-    [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --loglevel=error"
+    run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
+    [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
   fi
   read -rp "  Restart running services to apply? [Y/n] " yn
   if [[ ! "$yn" =~ ^[Nn]$ ]]; then
