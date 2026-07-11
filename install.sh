@@ -68,9 +68,9 @@ err()  {
 # Runs before anything else on every startup (interactive or CLI dispatch)
 # so this is always the latest version, whether it's a real clone of
 # codecade-install (git pull) or a standalone file someone curl'd down
-# (re-fetch the raw file and replace it if different). Silent/non-fatal if
+# (git-clone to a temp dir and replace if different). Silent/non-fatal if
 # offline or the update itself fails — never blocks the rest of the script.
-CODECADE_INSTALL_RAW_URL="https://raw.githubusercontent.com/SumDumIdiut/codecade-install/main/install.sh"
+CODECADE_INSTALL_GIT_URL="https://github.com/SumDumIdiut/codecade-install.git"
 self_update() {
   [ -n "${_CODECADE_SELF_UPDATED:-}" ] && return
 
@@ -89,14 +89,20 @@ self_update() {
       fi
     fi
   else
-    command -v curl >/dev/null 2>&1 || return
-    local tmp; tmp="$(mktemp 2>/dev/null)" || return
-    if curl -fsSL --max-time 5 "$CODECADE_INSTALL_RAW_URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] && bash -n "$tmp" 2>/dev/null; then
-      if ! cmp -s "$tmp" "$DIR/install.sh"; then
+    # Deliberately git-clone rather than curl the raw file:
+    # raw.githubusercontent.com sits behind a Varnish CDN with a 5-minute
+    # per-edge cache (confirmed via response headers), so a host routed to a
+    # stale edge could silently keep re-running an old version indefinitely.
+    # git operations hit GitHub's actual backend directly, not that cache.
+    command -v git >/dev/null 2>&1 || return
+    local tmpdir; tmpdir="$(mktemp -d 2>/dev/null)" || return
+    if git clone --depth 1 --quiet "$CODECADE_INSTALL_GIT_URL" "$tmpdir" 2>/dev/null \
+       && [ -s "$tmpdir/install.sh" ] && bash -n "$tmpdir/install.sh" 2>/dev/null; then
+      if ! cmp -s "$tmpdir/install.sh" "$DIR/install.sh"; then
         info "Updating install.sh..."
-        if cp "$tmp" "$DIR/install.sh" 2>/dev/null; then
+        if cp "$tmpdir/install.sh" "$DIR/install.sh" 2>/dev/null; then
           chmod +x "$DIR/install.sh" 2>/dev/null
-          rm -f "$tmp"
+          rm -rf "$tmpdir"
           ok "install.sh updated — restarting."
           _CODECADE_SELF_UPDATED=1 exec bash "$DIR/install.sh" "$@"
         else
@@ -104,7 +110,7 @@ self_update() {
         fi
       fi
     fi
-    rm -f "$tmp" 2>/dev/null
+    rm -rf "$tmpdir" 2>/dev/null
   fi
 }
 self_update "$@"
