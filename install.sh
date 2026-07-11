@@ -548,7 +548,7 @@ button:disabled{opacity:.4;cursor:default}
 <div class="drop" id="drop" onclick="document.getElementById('fi').click()">
   <div class="drop-icon">&#128190;</div>
   <div class="drop-label">Click to browse or drag &amp; drop</div>
-  <div class="drop-label" style="font-size:11px;margin-top:4px;opacity:.6">temutalk.key</div>
+  <div class="drop-label" style="font-size:11px;margin-top:4px;opacity:.6">key.key</div>
   <div class="drop-name" id="fname"></div>
 </div>
 <input type="file" id="fi" accept=".key,*">
