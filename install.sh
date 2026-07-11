@@ -1,0 +1,667 @@
+#!/bin/bash
+# codecade.co.za — master installer + control panel for the webdev portal.
+# Clones/updates temutalk and git-forge, sets each up under a URL prefix
+# (/temutalk, /forge), and runs both plus a landing portal behind one
+# Cloudflare Tunnel pointed at codecade.co.za.
+#
+# Safe to run repeatedly — every step here is idempotent.
+#
+#   bash install.sh                first run: clone, install, setup, then TUI
+#   bash install.sh start all      non-interactive start (used by the TUI itself)
+#   bash install.sh status         JSON status snapshot
+#   bash install.sh bundle <dest>  copy install.sh + all repos to <dest> (e.g. a
+#                                   mounted USB drive) so it can be plugged into
+#                                   any machine and run without needing network
+#                                   access to re-clone from GitHub
+
+set -uo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+cd "$DIR" || exit 1
+
+TEMUTALK_REPO="https://github.com/SumDumIdiut/temutalk.git"
+FORGE_REPO="https://github.com/SumDumIdiut/git-forge.git"
+TAG_REPO="https://github.com/SumDumIdiut/tag.git"
+CF_DOMAIN="codecade.co.za"
+PORTAL_PORT="${PORTAL_PORT:-8080}"
+TEMUTALK_PORT="${TEMUTALK_PORT:-3001}"
+FORGE_PORT="${FORGE_PORT:-3000}"
+TAG_RELAY_PORT="${TAG_RELAY_PORT:-3002}"
+
+# ─── Colour helpers (matches temutalk/install.sh) ───────────────────────────
+if [ -t 1 ]; then
+  C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
+  C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+else
+  C_BOLD=''; C_DIM=''; C_RESET=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''
+fi
+ok()   { echo "  ${C_GREEN}✓${C_RESET} $1"; }
+info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
+warn() { echo "  ${C_YELLOW}!${C_RESET} $1"; }
+err()  { echo "  ${C_RED}✗${C_RESET} $1"; }
+
+mkdir -p logs .run
+
+# ─── Clone / update the two app repos ───────────────────────────────────────
+clone_or_update() {
+  local dir="$1" url="$2" name="$3"
+  if [ -d "$dir/.git" ]; then
+    info "Updating $name..."
+    git -C "$dir" pull --ff-only || warn "$name: git pull failed — continuing with existing checkout"
+  else
+    info "Cloning $name..."
+    git clone "$url" "$dir" || { err "Clone of $name failed. Check your internet connection / git installation."; exit 1; }
+    ok "$name cloned."
+  fi
+}
+
+# ─── Binary/tool lookup ──────────────────────────────────────────────────────
+find_node()       { command -v node 2>/dev/null; }
+find_npm()        { command -v npm  2>/dev/null; }
+# temutalk bundles its own portable Node (no system install required) — prefer
+# that one for running temutalk specifically, matching its own install.sh.
+find_temutalk_node() {
+  [ -x "$DIR/temutalk/bin/linux/node" ] && { echo "$DIR/temutalk/bin/linux/node"; return; }
+  find_node
+}
+find_cloudflared() {
+  [ -x "$DIR/temutalk/bin/linux/cloudflared" ] && { echo "$DIR/temutalk/bin/linux/cloudflared"; return; }
+  command -v cloudflared 2>/dev/null
+}
+
+# ─── PID helpers ──────────────────────────────────────────────────────────────
+pid_file()     { echo "$DIR/.run/$1.pid"; }
+proc_running() { local f; f=$(pid_file "$1"); [ -f "$f" ] && kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/null; }
+proc_pid()     { local f; f=$(pid_file "$1"); [ -f "$f" ] && cat "$f"; }
+stop_proc() {
+  local name="$1"
+  if proc_running "$name"; then
+    kill "$(proc_pid "$name")" 2>/dev/null
+    rm -f "$(pid_file "$name")"
+    ok "$name stopped."
+  else
+    warn "$name wasn't running."
+  fi
+}
+
+# ─── Portal (no repo of its own — install.sh is the source of truth) ────────
+# The portal is just a thin reverse proxy + landing page tying the other
+# three apps together, so unlike them it isn't its own GitHub repo — it's
+# generated here, always overwritten to match this script exactly.
+write_portal_files() {
+  mkdir -p "$DIR/portal/public"
+
+  cat > "$DIR/portal/package.json" <<'PORTAL_PACKAGE_JSON'
+{
+  "name": "codecade-portal",
+  "version": "1.0.0",
+  "description": "Landing portal for codecade.co.za — proxies /temutalk, /forge and /tag to their backends",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy-middleware": "^2.0.6"
+  }
+}
+PORTAL_PACKAGE_JSON
+
+  cat > "$DIR/portal/server.js" <<'PORTAL_SERVER_JS'
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const TEMUTALK_TARGET = process.env.TEMUTALK_TARGET || 'https://127.0.0.1:3001';
+const FORGE_TARGET = process.env.FORGE_TARGET || 'http://127.0.0.1:3000';
+const TAG_RELAY_TARGET = process.env.TAG_RELAY_TARGET || 'http://127.0.0.1:3002';
+
+const app = express();
+
+// http-proxy-middleware preserves the mount prefix (/temutalk, /forge, /tag)
+// in the proxied request by default — each backend is BASE_PATH-aware and
+// expects it.
+const temutalkProxy = createProxyMiddleware({
+  target: TEMUTALK_TARGET,
+  changeOrigin: true,
+  secure: false, // temutalk's TLS cert is self-signed
+  ws: true,
+  logLevel: 'warn',
+});
+const forgeProxy = createProxyMiddleware({
+  target: FORGE_TARGET,
+  changeOrigin: true,
+  logLevel: 'warn',
+});
+const tagRelayProxy = createProxyMiddleware({
+  target: TAG_RELAY_TARGET,
+  changeOrigin: true,
+  ws: true, // /tag/relay/host, /relay/data/:token, /relay/join/:id are all WS upgrades
+  logLevel: 'warn',
+});
+
+app.use('/temutalk', temutalkProxy);
+app.use('/forge', forgeProxy);
+app.use('/tag', tagRelayProxy);
+app.use(express.static(path.join(__dirname, 'public')));
+
+const server = http.createServer(app);
+
+// Express only handles regular HTTP requests — WebSocket upgrades on the raw
+// server have to be routed to the matching proxy instance by hand.
+server.on('upgrade', (req, socket, head) => {
+  if (req.url.startsWith('/temutalk')) return temutalkProxy.upgrade(req, socket, head);
+  if (req.url.startsWith('/tag')) return tagRelayProxy.upgrade(req, socket, head);
+  socket.destroy();
+});
+
+server.listen(PORT, () => {
+  console.log(`\n  Portal running at http://localhost:${PORT}`);
+  console.log(`    /temutalk -> ${TEMUTALK_TARGET}`);
+  console.log(`    /forge    -> ${FORGE_TARGET}`);
+  console.log(`    /tag      -> ${TAG_RELAY_TARGET}\n`);
+});
+PORTAL_SERVER_JS
+
+  cat > "$DIR/portal/public/index.html" <<'PORTAL_INDEX_HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>codecade.co.za</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #0b0d14; color: #e4e7f0;
+    padding: 24px;
+  }
+  .wrap { width: 100%; max-width: 420px; }
+  h1 { font-size: 22px; font-weight: 800; margin-bottom: 6px; letter-spacing: -0.01em; }
+  .sub { color: #7b82a8; font-size: 13px; margin-bottom: 28px; }
+  .card {
+    display: flex; align-items: center; gap: 14px;
+    padding: 16px 18px; margin-bottom: 12px;
+    border-radius: 14px; border: 1.5px solid rgba(255,255,255,.09);
+    background: rgba(255,255,255,.04);
+    text-decoration: none; color: inherit;
+    transition: background .15s, border-color .15s, transform .15s;
+  }
+  .card:hover { background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.16); transform: translateY(-1px); }
+  .icon {
+    width: 40px; height: 40px; border-radius: 10px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 19px;
+  }
+  .icon.tt { background: rgba(124,108,248,.18); }
+  .icon.fg { background: rgba(249,115,22,.18); }
+  .icon.tag { background: rgba(62,245,168,.18); }
+  .card-title { font-weight: 700; font-size: 14.5px; }
+  .card-desc { color: #7b82a8; font-size: 12.5px; margin-top: 2px; }
+  footer { margin-top: 24px; color: #4e5578; font-size: 11.5px; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>codecade.co.za</h1>
+    <p class="sub">Pick a service.</p>
+    <a class="card" href="/temutalk/">
+      <div class="icon tt">🎧</div>
+      <div>
+        <div class="card-title">TemuTalk</div>
+        <div class="card-desc">Music, cast, chat, weather &amp; more</div>
+      </div>
+    </a>
+    <a class="card" href="/forge/">
+      <div class="icon fg">🔥</div>
+      <div>
+        <div class="card-title">Forge</div>
+        <div class="card-desc">Self-hosted Git repositories</div>
+      </div>
+    </a>
+    <a class="card" href="/tag/">
+      <div class="icon tag">🏃</div>
+      <div>
+        <div class="card-title">Tag</div>
+        <div class="card-desc">Browse live multiplayer servers</div>
+      </div>
+    </a>
+    <footer>codecade.co.za</footer>
+  </div>
+</body>
+</html>
+PORTAL_INDEX_HTML
+
+  ok "Portal files written."
+}
+
+# ─── First-run / update setup ────────────────────────────────────────────────
+do_setup() {
+  clone_or_update temutalk "$TEMUTALK_REPO" temutalk
+  clone_or_update git-forge "$FORGE_REPO" git-forge
+  clone_or_update tag "$TAG_REPO" tag
+
+  # Unlike the three apps above, the portal has no repo of its own — it's
+  # thin enough (one proxy + one landing page) that install.sh just writes
+  # it out directly, so it's fully reproducible from this script alone.
+  write_portal_files
+
+  local npm_bin; npm_bin=$(find_npm)
+  if [ -z "$npm_bin" ]; then
+    err "npm not found on PATH — install Node.js/npm to set up the portal and git-forge."
+    exit 1
+  fi
+
+  info "Installing portal dependencies..."
+  ( cd "$DIR/portal" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
+    && ok "Portal dependencies installed." || err "Portal npm install failed."
+
+  info "Installing git-forge dependencies..."
+  ( cd "$DIR/git-forge" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
+    && ok "git-forge dependencies installed." || err "git-forge npm install failed."
+
+  if [ -d "$DIR/tag/relay-server" ]; then
+    info "Installing tag relay-server dependencies..."
+    ( cd "$DIR/tag/relay-server" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) \
+      && ok "tag relay-server dependencies installed." || err "tag relay-server npm install failed."
+  else
+    warn "tag/relay-server not found in the tag repo checkout — skipping."
+  fi
+
+  info "Running temutalk's own first-run setup (system deps, portable Node, Piper, audio, USB key)..."
+  # < /dev/null: belt-and-suspenders against temutalk/install.sh ever blocking
+  # on an interactive read — it shouldn't in "setup" mode, but a subprocess
+  # otherwise inherits our real TTY, and a stuck read here would silently
+  # hang this whole script with no obvious cause.
+  bash "$DIR/temutalk/install.sh" setup < /dev/null
+
+  echo ""
+  ok "Setup complete."
+}
+
+# ─── Bundle: copy install.sh + all repos to portable media ─────────────────
+# So the whole stack (source, .git history, already-installed node_modules)
+# can be plugged into any machine and run without needing network access to
+# re-clone from GitHub — clone_or_update() above already treats an existing
+# .git checkout as "already cloned" and only needs network for a `git pull`,
+# which fails non-fatally offline and just runs with what's there.
+do_bundle() {
+  local dest="${1:-}"
+  if [ -z "$dest" ]; then err "Usage: install.sh bundle <destination-dir>"; exit 1; fi
+  if [ ! -d "$dest" ]; then err "Destination '$dest' does not exist or is not a directory."; exit 1; fi
+  dest="$(cd "$dest" && pwd)"
+  if [ "$dest" = "$DIR" ]; then err "Destination is the same directory install.sh is already running from."; exit 1; fi
+
+  for name in temutalk git-forge tag; do
+    if [ ! -d "$DIR/$name/.git" ]; then
+      warn "$name isn't cloned locally yet — running setup first."
+      do_setup
+      break
+    fi
+  done
+
+  local use_rsync=0
+  command -v rsync >/dev/null 2>&1 && use_rsync=1
+
+  info "Copying install.sh -> $dest/install.sh"
+  cp "$DIR/install.sh" "$dest/install.sh"
+
+  for name in temutalk git-forge tag; do
+    info "Copying $name -> $dest/$name (this can take a while)..."
+    if [ "$use_rsync" -eq 1 ]; then
+      mkdir -p "$dest/$name"
+      rsync -a --delete "$DIR/$name/" "$dest/$name/" \
+        && ok "$name copied." || err "$name copy failed."
+    else
+      rm -rf "$dest/$name"
+      cp -a "$DIR/$name" "$dest/$name" \
+        && ok "$name copied." || err "$name copy failed."
+    fi
+  done
+
+  echo ""
+  ok "Bundle complete -> $dest"
+  echo "  Plug this drive into any machine and run:  bash $dest/install.sh"
+}
+
+# ─── Start / stop — individual services ─────────────────────────────────────
+start_forge() {
+  if proc_running forge; then warn "git-forge already running."; return; fi
+  local node_bin; node_bin=$(find_node)
+  if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
+  ( cd "$DIR/git-forge" && BASE_PATH=/forge PORT="$FORGE_PORT" \
+    nohup "$node_bin" server.js > "$DIR/logs/forge.log" 2>&1 & echo $! > "$(pid_file forge)" )
+  sleep 1
+  if proc_running forge; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
+  else err "git-forge failed to start — check logs/forge.log"; fi
+}
+
+start_tag_relay() {
+  if proc_running tag-relay; then warn "tag relay-server already running."; return; fi
+  if [ ! -d "$DIR/tag/relay-server/node_modules" ]; then warn "tag/relay-server/node_modules missing — run setup first."; return; fi
+  local node_bin; node_bin=$(find_node)
+  if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
+  ( cd "$DIR/tag/relay-server" && BASE_PATH=/tag PORT="$TAG_RELAY_PORT" \
+    nohup "$node_bin" server.js > "$DIR/logs/tag-relay.log" 2>&1 & echo $! > "$(pid_file tag-relay)" )
+  sleep 1
+  if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
+  else err "tag relay-server failed to start — check logs/tag-relay.log"; fi
+}
+
+start_temutalk() {
+  if proc_running temutalk; then warn "temutalk already running."; return; fi
+  if [ ! -d "$DIR/temutalk/node_modules" ]; then warn "temutalk/node_modules missing — run setup first."; return; fi
+  local node_bin; node_bin=$(find_temutalk_node)
+  if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
+  ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
+    nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo $! > "$(pid_file temutalk)" )
+  sleep 2
+  if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
+  else err "temutalk failed to start — check logs/temutalk.log"; fi
+}
+
+start_portal() {
+  if proc_running portal; then warn "Portal already running."; return; fi
+  local node_bin; node_bin=$(find_node)
+  if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
+  ( cd "$DIR/portal" && PORT="$PORTAL_PORT" \
+    TEMUTALK_TARGET="https://127.0.0.1:$TEMUTALK_PORT" FORGE_TARGET="http://127.0.0.1:$FORGE_PORT" \
+    TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" \
+    nohup "$node_bin" server.js > "$DIR/logs/portal.log" 2>&1 & echo $! > "$(pid_file portal)" )
+  sleep 1
+  if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
+  else err "Portal failed to start — check logs/portal.log"; fi
+}
+
+# Reuses temutalk's existing tunnel credentials in temutalk/.cloudflared/, but
+# repoints the single ingress hostname at the portal instead of temutalk
+# directly, since the portal is now the one thing the tunnel talks to.
+_TUNNEL_TOKEN_FILE=""; _TUNNEL_CONFIG_FILE=""
+write_tunnel_config() {
+  local cf_dir="$DIR/temutalk/.cloudflared"
+  [ -d "$cf_dir" ] || return 1
+  local f
+  for f in "$cf_dir/token.txt" "$HOME/.cloudflared/token.txt"; do
+    if [ -f "$f" ]; then _TUNNEL_TOKEN_FILE="$f"; return 0; fi
+  done
+  local json; json=$(find "$cf_dir" -maxdepth 1 -regex '.*/[0-9a-fA-F-]\{36\}\.json' 2>/dev/null | head -1)
+  [ -z "$json" ] && return 1
+  local tunnel_id; tunnel_id=$(basename "$json" .json)
+  _TUNNEL_CONFIG_FILE="$cf_dir/config.yml"
+  cat > "$_TUNNEL_CONFIG_FILE" <<EOF
+tunnel: ${tunnel_id}
+credentials-file: ${json}
+ingress:
+  - hostname: ${CF_DOMAIN}
+    service: http://localhost:${PORTAL_PORT}
+  - service: http_status:404
+EOF
+  return 0
+}
+
+start_tunnel() {
+  if proc_running tunnel; then warn "Tunnel already running."; return; fi
+  local cf_bin; cf_bin=$(find_cloudflared)
+  if [ -z "$cf_bin" ]; then warn "cloudflared not found — running local only."; return; fi
+  _TUNNEL_TOKEN_FILE=""; _TUNNEL_CONFIG_FILE=""
+  if ! write_tunnel_config; then
+    warn "No tunnel credentials in temutalk/.cloudflared — running local only."
+    return
+  fi
+  local args=()
+  if [ -n "$_TUNNEL_TOKEN_FILE" ]; then
+    local ingress_cfg; ingress_cfg="$(mktemp)"
+    cat > "$ingress_cfg" <<EOF
+ingress:
+  - hostname: ${CF_DOMAIN}
+    service: http://localhost:${PORTAL_PORT}
+  - service: http_status:404
+EOF
+    local token; token=$(tr -d '\r\n' < "$_TUNNEL_TOKEN_FILE")
+    args=(tunnel --config "$ingress_cfg" run --token "$token")
+  else
+    local cert_file="$DIR/temutalk/.cloudflared/cert.pem"
+    [ -f "$cert_file" ] && args+=(--origincert "$cert_file")
+    args+=(--config "$_TUNNEL_CONFIG_FILE" tunnel run)
+  fi
+  nohup "$cf_bin" "${args[@]}" > "$DIR/logs/tunnel.log" 2>&1 &
+  echo $! > "$(pid_file tunnel)"
+  sleep 2
+  if proc_running tunnel; then ok "Tunnel started (PID $(proc_pid tunnel)) → https://${CF_DOMAIN}"
+  else err "Tunnel failed to start — check logs/tunnel.log"; fi
+}
+
+do_start() { start_forge; start_tag_relay; start_temutalk; start_portal; start_tunnel; }
+do_stop()  { stop_proc tunnel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
+
+status_json() {
+  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false
+  proc_running forge     && forge_run=true
+  proc_running temutalk  && temutalk_run=true
+  proc_running portal    && portal_run=true
+  proc_running tunnel    && tunnel_run=true
+  proc_running tag-relay && tag_relay_run=true
+  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"url":"https://%s"}\n' \
+    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$CF_DOMAIN"
+}
+
+do_open_browser() {
+  local url="https://${CF_DOMAIN}"
+  echo "  URL: ${C_CYAN}${url}${C_RESET}"
+  if ! proc_running portal; then warn "Portal isn't running — start it first."; return; fi
+  if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v open     >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 &
+  else warn "No browser opener found — open the URL above manually."
+  fi
+}
+
+do_check_updates() {
+  info "Checking temutalk, git-forge and tag for updates..."
+  clone_or_update temutalk "$TEMUTALK_REPO" temutalk
+  clone_or_update git-forge "$FORGE_REPO" git-forge
+  clone_or_update tag "$TAG_REPO" tag
+  local npm_bin; npm_bin=$(find_npm)
+  if [ -n "$npm_bin" ]; then
+    ( cd "$DIR/git-forge" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) >/dev/null 2>&1
+    [ -d "$DIR/tag/relay-server" ] && ( cd "$DIR/tag/relay-server" && "$npm_bin" install --no-audit --no-fund --loglevel=error ) >/dev/null 2>&1
+  fi
+  read -rp "  Restart running services to apply? [Y/n] " yn
+  if [[ ! "$yn" =~ ^[Nn]$ ]]; then
+    proc_running forge     && { stop_proc forge;     start_forge; }
+    proc_running tag-relay && { stop_proc tag-relay; start_tag_relay; }
+    proc_running temutalk  && { stop_proc temutalk;  start_temutalk; }
+    ok "Restarted."
+  fi
+  _updates_available=0
+  _last_update_check=$(date +%s)
+}
+
+do_view_logs() {
+  echo "  ${C_DIM}Ctrl+C to return to the menu.${C_RESET}"
+  sleep 1
+  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log
+  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log
+}
+
+# ─── Non-interactive CLI dispatch ────────────────────────────────────────────
+if [ "${1:-}" = "setup" ]; then do_setup; exit 0; fi
+if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
+if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
+  case "${2:-}" in
+    forge|temutalk|portal|tunnel|tag-relay|all) ;;
+    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|all}"; exit 1 ;;
+  esac
+  case "$1-$2" in
+    start-forge)     start_forge ;;
+    start-temutalk)  start_temutalk ;;
+    start-portal)    start_portal ;;
+    start-tunnel)    start_tunnel ;;
+    start-tag-relay) start_tag_relay ;;
+    start-all)       do_start ;;
+    stop-forge)      stop_proc forge ;;
+    stop-temutalk)   stop_proc temutalk ;;
+    stop-portal)     stop_proc portal ;;
+    stop-tunnel)     stop_proc tunnel ;;
+    stop-tag-relay)  stop_proc tag-relay ;;
+    stop-all)        do_stop ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = "status" ]; then status_json; exit 0; fi
+
+# ─── First-run setup, then TUI ───────────────────────────────────────────────
+echo ""
+echo "  ${C_BOLD}codecade.co.za — Portal Installer${C_RESET}"
+echo ""
+do_setup
+
+echo ""
+warn "One-time manual step: temutalk now lives at /temutalk, so its Spotify"
+warn "OAuth redirect URI changed. Update it in the Spotify Developer Dashboard:"
+echo "     ${C_CYAN}https://${CF_DOMAIN}/temutalk/callback${C_RESET}"
+warn "Spotify login will not work until this is updated."
+
+MENU_LABELS=(
+  "Start all"
+  "Stop all"
+  "Open in browser"
+  "Check for updates"
+  "View logs"
+  "Toggle Forge"
+  "Toggle TemuTalk"
+  "Toggle Portal"
+  "Toggle Tunnel"
+  "Toggle Tag relay"
+  "Bundle to a drive..."
+  "Exit"
+)
+_menu_selected=0
+
+# Reads one keypress, with a timeout so the menu loop periodically wakes up
+# on its own (used to drive the quiet background update check below) even
+# if nobody presses anything. Arrow keys arrive as a 3-byte escape sequence
+# (ESC [ A/B/C/D) — a lone ESC (e.g. someone just tapping Escape) times out
+# on the second read instead of hanging, and falls through as an ignored key.
+read_key() {
+  local key rest
+  IFS= read -rsn1 -t 5 key
+  if [ $? -gt 128 ]; then
+    printf 'TIMEOUT'
+    return
+  fi
+  if [ "$key" = $'\x1b' ]; then
+    IFS= read -rsn2 -t 0.05 rest
+    key+="$rest"
+  fi
+  printf '%s' "$key"
+}
+
+# ─── Quiet background update check ──────────────────────────────────────────
+# Only ever *notifies* — never auto-pulls or auto-restarts anything without
+# the user explicitly choosing "Check for updates", so a running server never
+# gets yanked out from under it unexpectedly. Gated to every 30 minutes;
+# read_key()'s timeout above is what actually gives this a chance to run
+# periodically while the TUI sits idle.
+UPDATE_CHECK_INTERVAL_SEC=1800
+_last_update_check=0
+_updates_available=0
+check_for_updates_quiet() {
+  local now; now=$(date +%s)
+  [ $(( now - _last_update_check )) -lt "$UPDATE_CHECK_INTERVAL_SEC" ] && return
+  _last_update_check=$now
+  _updates_available=0
+  local name local_sha remote_sha
+  for name in temutalk git-forge tag; do
+    [ -d "$DIR/$name/.git" ] || continue
+    git -C "$DIR/$name" fetch --quiet origin main 2>/dev/null || continue
+    local_sha=$(git -C "$DIR/$name" rev-parse HEAD 2>/dev/null)
+    remote_sha=$(git -C "$DIR/$name" rev-parse origin/main 2>/dev/null)
+    [ -n "$local_sha" ] && [ -n "$remote_sha" ] && [ "$local_sha" != "$remote_sha" ] && _updates_available=1
+  done
+}
+
+menu() {
+  while true; do
+    check_for_updates_quiet
+    clear
+    echo "  ${C_BOLD}╔══════════════════════════════════════╗${C_RESET}"
+    echo "  ${C_BOLD}║      codecade.co.za — Portal TUI      ║${C_RESET}"
+    echo "  ${C_BOLD}╚══════════════════════════════════════╝${C_RESET}"
+    echo ""
+    proc_running forge     && echo "  Forge    : ${C_GREEN}running${C_RESET} (PID $(proc_pid forge))"     || echo "  Forge    : ${C_DIM}stopped${C_RESET}"
+    proc_running tag-relay && echo "  Tag relay: ${C_GREEN}running${C_RESET} (PID $(proc_pid tag-relay))" || echo "  Tag relay: ${C_DIM}stopped${C_RESET}"
+    proc_running temutalk  && echo "  TemuTalk : ${C_GREEN}running${C_RESET} (PID $(proc_pid temutalk))"  || echo "  TemuTalk : ${C_DIM}stopped${C_RESET}"
+    proc_running portal    && echo "  Portal   : ${C_GREEN}running${C_RESET} (PID $(proc_pid portal))"    || echo "  Portal   : ${C_DIM}stopped${C_RESET}"
+    proc_running tunnel    && echo "  Tunnel   : ${C_GREEN}running${C_RESET} (PID $(proc_pid tunnel))"     || echo "  Tunnel   : ${C_DIM}stopped${C_RESET}"
+    echo "  URL      : https://${CF_DOMAIN}"
+    if [ "$_updates_available" -eq 1 ]; then
+      echo "  ${C_YELLOW}Updates available — select \"Check for updates\" to pull.${C_RESET}"
+    fi
+    echo ""
+    echo "  ${C_DIM}↑/↓ to move, Enter to select${C_RESET}"
+    echo ""
+    for i in "${!MENU_LABELS[@]}"; do
+      if [ "$i" -eq "$_menu_selected" ]; then
+        echo "  ${C_CYAN}▸ ${MENU_LABELS[$i]}${C_RESET}"
+      else
+        echo "    ${MENU_LABELS[$i]}"
+      fi
+    done
+
+    local key; key=$(read_key)
+    case "$key" in
+      TIMEOUT)
+        continue
+        ;;
+      $'\x1b[A')
+        _menu_selected=$(( (_menu_selected - 1 + ${#MENU_LABELS[@]}) % ${#MENU_LABELS[@]} ))
+        continue
+        ;;
+      $'\x1b[B')
+        _menu_selected=$(( (_menu_selected + 1) % ${#MENU_LABELS[@]} ))
+        continue
+        ;;
+      "") ;; # Enter -- fall through and act on the selected item
+      q|Q)
+        echo ""; echo "  Bye."
+        exit 0
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    echo ""
+    case "$_menu_selected" in
+      0) do_start ;;
+      1) do_stop ;;
+      2) do_open_browser ;;
+      3) do_check_updates ;;
+      4) do_view_logs ;;
+      5) if proc_running forge;     then stop_proc forge;     else start_forge;     fi ;;
+      6) if proc_running temutalk;  then stop_proc temutalk;  else start_temutalk;  fi ;;
+      7) if proc_running portal;    then stop_proc portal;    else start_portal;    fi ;;
+      8) if proc_running tunnel;    then stop_proc tunnel;    else start_tunnel;    fi ;;
+      9) if proc_running tag-relay; then stop_proc tag-relay; else start_tag_relay; fi ;;
+      10)
+        read -rp "  Destination path (e.g. a mounted USB drive): " bundle_dest
+        [ -n "$bundle_dest" ] && do_bundle "$bundle_dest"
+        ;;
+      11)
+        echo "  Bye."
+        exit 0
+        ;;
+    esac
+    echo ""
+    read -rp "  Press Enter to continue..." _
+  done
+}
+
+menu
