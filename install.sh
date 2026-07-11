@@ -1731,6 +1731,12 @@ do_setup() {
     warn "tag/relay-server not found in the tag repo checkout — skipping."
   fi
 
+  # Defense-in-depth against CRLF creeping back in: temutalk's own
+  # .gitattributes now forces LF checkouts, but a drive cloned before that
+  # fix (or a checkout from a machine that ignores it for some reason) would
+  # otherwise crash bash with "$'\r': command not found" on every line.
+  [ -f "$DIR/temutalk/install.sh" ] && sed -i 's/\r$//' "$DIR/temutalk/install.sh" 2>/dev/null
+
   info "Running temutalk's own first-run setup (system deps, portable Node, Piper, audio, USB key)..."
   # < /dev/null: belt-and-suspenders against temutalk/install.sh ever blocking
   # on an interactive read — it shouldn't in "setup" mode, but a subprocess
