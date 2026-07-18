@@ -2427,6 +2427,15 @@ find_temutalk_usb_mount() {
   # logical key drive keeps being found even if the OS assigns it a
   # different mount name after a replug/reboot; otherwise fall back to
   # whichever removable drive is present, for first-time key generation.
+  #
+  # -w is required on the fallback candidate -- confirmed live under WSL,
+  # where Windows drives are auto-mounted at /mnt/c, /mnt/d, etc: with no
+  # real USB plugged in, this loop happily "found" /mnt/c (the entire
+  # Windows C:\ root) as a candidate, tried to write key.key there,
+  # silently failed (Permission denied), and still went on to claim
+  # success. /mnt isn't exclusively removable media on plenty of real Linux
+  # setups either, not just WSL, so this check matters generally, not just
+  # for this one environment.
   local root d candidate=""
   for root in "/media/$user" "/run/media/$user" "/media" "/mnt"; do
     [ -d "$root" ] || continue
@@ -2434,7 +2443,7 @@ find_temutalk_usb_mount() {
       [ -d "$d" ] || continue
       d="${d%/}"
       if [ -f "$d/key.key" ]; then echo "$d"; return; fi
-      [ -z "$candidate" ] && candidate="$d"
+      [ -z "$candidate" ] && [ -w "$d" ] && candidate="$d"
     done
   done
   [ -n "$candidate" ] && echo "$candidate"
@@ -2457,10 +2466,21 @@ setup_temutalk_usb_key() {
     info "Generating 1000-character key on USB..."
     mkdir -p "$DIR/temutalk/.run"
     tr -dc 'A-Za-z0-9+/=' < /dev/urandom 2>/dev/null | head -c 1000 > "$key_file"
+    # Confirmed live: a write that silently failed (permission denied on a
+    # bad USB-detection fallback) still printed "Key written" and then
+    # "Key hash enrolled" below, with nothing ever actually enrolled --
+    # verify the file is really there with real content before saying so.
+    if [ ! -s "$key_file" ]; then
+      err "Failed to write key to $key_file — check permissions on the USB mount."
+      return
+    fi
     ok "Key written to $key_file"
   fi
   mkdir -p "$DIR/temutalk/.run"
-  sha256sum < "$key_file" | cut -c1-64 > "$TEMUTALK_KEY_HASH_FILE"
+  if ! sha256sum < "$key_file" | cut -c1-64 > "$TEMUTALK_KEY_HASH_FILE"; then
+    err "Failed to hash $key_file — USB key not enrolled."
+    return
+  fi
   chmod 600 "$TEMUTALK_KEY_HASH_FILE"
   ok "Key hash enrolled. Dev panel now requires this USB to be plugged in."
 }
