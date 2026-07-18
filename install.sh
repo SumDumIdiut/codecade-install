@@ -274,6 +274,19 @@ snapshot_log_on_failure() {
   err "$label failed — check $logfile (snapshot: $dest)"
 }
 
+# Wipes every recorded error (errors.log + per-failure snapshot files) so a
+# fresh start attempt is never confused with stale failures from an earlier
+# run (a real prior symptom: a since-fixed tunnel-credentials warning kept
+# showing up in the DIAGNOSTICS view long after the actual fix landed,
+# because nothing ever cleared the old snapshot). Called at the top of
+# do_start() -- if this attempt has real failures, they'll be recorded
+# fresh; if it succeeds clean, there's nothing stale left over to confuse
+# the next person looking at DIAGNOSTICS.
+clear_error_logs() {
+  rm -f errors/*.log 2>/dev/null
+  : > errors/errors.log 2>/dev/null
+}
+
 update_checkout_hard() {
   local dir="$1"
   # Don't hardcode a branch name -- git-forge's default branch is "master",
@@ -281,7 +294,23 @@ update_checkout_hard() {
   # out is what HEAD already points at, so read that back instead of
   # guessing (this broke git-forge updates: "couldn't find remote ref main").
   local branch; branch=$(git_safe "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 1
-  git_safe "$dir" fetch --quiet origin "$branch" && git_safe "$dir" reset --quiet --hard "origin/$branch"
+  if git_safe "$dir" fetch --quiet origin "$branch" \
+     && git_safe "$dir" reset --quiet --hard "origin/$branch"; then
+    return 0
+  fi
+  # A corrupted .git/index (confirmed live: "index file smaller than
+  # expected" -- the same USB-write-interruption failure mode documented on
+  # clone_or_update() below) makes `fetch` itself fail, not just `reset
+  # --hard` -- confirmed live that even `fetch` refuses with this exact
+  # error on a truncated index, so a fix that only retried `reset --hard`
+  # never actually ran (fetch's `|| return 1` triggered first). HEAD still
+  # resolves fine either way, so clone_or_update()'s rev-parse-HEAD check
+  # doesn't catch this. The index is disposable (`reset --hard` fully
+  # rebuilds it from the target tree), so drop it and retry the whole
+  # sequence once before giving up.
+  rm -f "$dir/.git/index"
+  git_safe "$dir" fetch --quiet origin "$branch" \
+    && git_safe "$dir" reset --quiet --hard "origin/$branch"
 }
 
 # ─── Clone / update the two app repos ───────────────────────────────────────
@@ -2126,10 +2155,6 @@ find_ffmpeg() {
 # (not just the node binary) because npm itself lives alongside it --
 # lib/node_modules/npm/ on Linux, node_modules/npm/ on Windows.
 ensure_portable_node() {
-  if [ -x "$DIR/.bin/node" ] && [ -x "$DIR/.bin/npm" ]; then
-    ok "Portable Node.js already present."
-    return
-  fi
   local os arch node_arch
   os=$(detect_os)
   arch=$(uname -m)
@@ -2142,36 +2167,52 @@ ensure_portable_node() {
   [ "$os" = "windows" ] && [ "$node_arch" = "armv7l" ] && node_arch=arm64
 
   mkdir -p "$DIR/.bin"
-  rm -rf "$DIR/.bin/node-runtime"
-  mkdir -p "$DIR/.bin/node-runtime"
 
-  local platform_tag archive_ext node_bin_path npm_cli_path
+  # *_rel are relative to $DIR/.bin/ -- used inside the wrapper scripts below
+  # so they resolve themselves at runtime instead of baking in $DIR as a
+  # literal absolute path (this whole tree is designed to be plugged into
+  # different machines/mount points; a wrapper generated while $DIR was
+  # e.g. /media/terraserver/USB breaks the instant the same drive shows up
+  # as E:\ on a different machine -- confirmed live).
+  local platform_tag archive_ext node_bin_path npm_cli_path node_bin_rel npm_cli_rel
   if [ "$os" = "windows" ]; then
     platform_tag="win-${node_arch}"; archive_ext="zip"
-    node_bin_path="$DIR/.bin/node-runtime/node.exe"
-    npm_cli_path="$DIR/.bin/node-runtime/node_modules/npm/bin/npm-cli.js"
+    node_bin_rel="node-runtime/node.exe"
+    npm_cli_rel="node-runtime/node_modules/npm/bin/npm-cli.js"
   else
     platform_tag="linux-${node_arch}"; archive_ext="tar.gz"
-    node_bin_path="$DIR/.bin/node-runtime/bin/node"
-    npm_cli_path="$DIR/.bin/node-runtime/lib/node_modules/npm/bin/npm-cli.js"
+    node_bin_rel="node-runtime/bin/node"
+    npm_cli_rel="node-runtime/lib/node_modules/npm/bin/npm-cli.js"
   fi
+  node_bin_path="$DIR/.bin/$node_bin_rel"
+  npm_cli_path="$DIR/.bin/$npm_cli_rel"
 
-  info "Downloading portable Node.js ($platform_tag)..."
-  local tarball
-  tarball=$(dl_curl_silent "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt" \
-    | grep "${platform_tag}\.${archive_ext}$" | awk '{print $2}' | head -1)
-  if [ -z "$tarball" ]; then
-    err "Could not determine latest Node.js build for $platform_tag."
-    return
-  fi
-  dl_curl -o "$DIR/.bin/node.archive" "https://nodejs.org/dist/latest-v20.x/${tarball}"
-  if [ "$archive_ext" = "zip" ]; then
-    extract_zip_stripped "$DIR/.bin/node.archive" "$DIR/.bin/node-runtime"
+  # Skip the download if the actual runtime is already there -- but the
+  # wrapper scripts below always get rewritten regardless (cheap, and self-
+  # heals a wrapper that baked in a stale absolute path from a previous
+  # machine/mount point, like the one above describes).
+  if [ -x "$node_bin_path" ] && [ -f "$npm_cli_path" ]; then
+    :
   else
-    tar -xzf "$DIR/.bin/node.archive" -C "$DIR/.bin/node-runtime" --strip-components=1
+    info "Downloading portable Node.js ($platform_tag)..."
+    local tarball
+    tarball=$(dl_curl_silent "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt" \
+      | grep "${platform_tag}\.${archive_ext}$" | awk '{print $2}' | head -1)
+    if [ -z "$tarball" ]; then
+      err "Could not determine latest Node.js build for $platform_tag."
+      return
+    fi
+    rm -rf "$DIR/.bin/node-runtime"
+    mkdir -p "$DIR/.bin/node-runtime"
+    dl_curl -o "$DIR/.bin/node.archive" "https://nodejs.org/dist/latest-v20.x/${tarball}"
+    if [ "$archive_ext" = "zip" ]; then
+      extract_zip_stripped "$DIR/.bin/node.archive" "$DIR/.bin/node-runtime"
+    else
+      tar -xzf "$DIR/.bin/node.archive" -C "$DIR/.bin/node-runtime" --strip-components=1
+    fi
+    rm -f "$DIR/.bin/node.archive"
+    chmod +x "$node_bin_path" 2>/dev/null
   fi
-  rm -f "$DIR/.bin/node.archive"
-  chmod +x "$node_bin_path" 2>/dev/null
 
   # bin/node and bin/npm inside the extracted tree are frequently symlinks
   # (npm always is: bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js) --
@@ -2182,15 +2223,22 @@ ensure_portable_node() {
   # tree's own links -- same fix already applied to Piper's .so link chain
   # below, and it sidesteps needing to know whether Windows' own npm/npm.cmd
   # wrappers extracted correctly too.
+  #
+  # $here is resolved at RUN time (dirname "$0"), not baked in as the
+  # absolute $DIR from when this wrapper was generated -- otherwise a
+  # wrapper written while this drive was e.g. /media/terraserver/USB stops
+  # working the instant the same drive shows up as E:\ on another machine.
   cat > "$DIR/.bin/node" <<NODE_WRAPPER
 #!/bin/sh
-exec "$node_bin_path" "\$@"
+here="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$here/$node_bin_rel" "\$@"
 NODE_WRAPPER
   chmod +x "$DIR/.bin/node"
 
   cat > "$DIR/.bin/npm" <<NPM_WRAPPER
 #!/bin/sh
-exec "$node_bin_path" "$npm_cli_path" "\$@"
+here="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$here/$node_bin_rel" "\$here/$npm_cli_rel" "\$@"
 NPM_WRAPPER
   chmod +x "$DIR/.bin/npm"
   ok "Portable Node.js ready."
@@ -2433,7 +2481,17 @@ write_tunnel_config() {
   for f in "$cf_dir/token.txt" "$HOME/.cloudflared/token.txt"; do
     if [ -f "$f" ]; then _TUNNEL_TOKEN_FILE="$f"; return 0; fi
   done
-  local json; json=$(find "$cf_dir" -maxdepth 1 -regex '.*/[0-9a-fA-F-]\{36\}\.json' 2>/dev/null | head -1)
+  # Match via bash's own regex engine, not `find -regex` -- find's regex
+  # dialect varies by platform (GNU find defaults to "emacs", which doesn't
+  # support \{36\} intervals at all; BusyBox find on Alpine-based hosts
+  # doesn't support -regex/-regextype in the first place). This silently
+  # matched nothing against a real, perfectly intact credentials file every
+  # single time (confirmed live against GNU find) until this was rewritten.
+  local json="" candidate
+  for candidate in "$cf_dir"/*.json; do
+    [ -f "$candidate" ] || continue
+    [[ "$(basename "$candidate")" =~ ^[0-9a-fA-F-]{36}\.json$ ]] && { json="$candidate"; break; }
+  done
   [ -z "$json" ] && return 1
   local tunnel_id; tunnel_id=$(basename "$json" .json)
   _TUNNEL_CONFIG_FILE="$cf_dir/config.yml"
@@ -2480,7 +2538,7 @@ EOF
   else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
 }
 
-do_start() { start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel; }
+do_start() { clear_error_logs; start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel; }
 do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
 
 status_json() {
