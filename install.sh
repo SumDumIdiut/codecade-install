@@ -42,7 +42,12 @@ DEV_PANEL_PORT="${DEV_PANEL_PORT:-9091}"
 # -c, never touches the user's persistent gitconfig.
 git_safe() {
   local dir="$1"; shift
-  git -c safe.directory="$dir" -C "$dir" "$@"
+  # "*" (not "$dir") because on Windows/git-bash, MSYS's POSIX-style path
+  # (e.g. /e/temutalk) never string-matches git's own Windows-style resolved
+  # repo path (E:/temutalk), so safe.directory="$dir" silently never applies
+  # and every call still fails with "dubious ownership". Scoped to this one
+  # -c invocation only -- never written to any persisted git config.
+  git -c safe.directory='*' -C "$dir" "$@"
 }
 
 # ─── Colour helpers (matches temutalk/install.sh) ───────────────────────────
