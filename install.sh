@@ -49,12 +49,8 @@ git_safe() {
 if [ -t 1 ]; then
   C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
   C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
-  # Extra accents for the TUI's tab bar/header -- not used by the plain
-  # ok()/info()/warn()/err() log lines, which stay exactly as they were.
-  C_MAGENTA=$'\033[35m'; C_BLUE=$'\033[34m'; C_WHITE=$'\033[97m'
 else
   C_BOLD=''; C_DIM=''; C_RESET=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''
-  C_MAGENTA=''; C_BLUE=''; C_WHITE=''
 fi
 ok()   { echo "  ${C_GREEN}✓${C_RESET} $1"; }
 info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
@@ -2321,12 +2317,6 @@ echo "  ${C_BOLD}codecade.co.za — Portal Installer${C_RESET}"
 echo ""
 do_setup
 
-echo ""
-warn "One-time manual step: temutalk now lives at /temutalk, so its Spotify"
-warn "OAuth redirect URI changed. Update it in the Spotify Developer Dashboard:"
-echo "     ${C_CYAN}https://${CF_DOMAIN}/temutalk/callback${C_RESET}"
-warn "Spotify login will not work until this is updated."
-
 # Three subtabs instead of one long flat list -- CONTROL for whole-stack
 # actions, SERVICES for toggling one process at a time, DIAGNOSTICS for
 # everything read-only/investigative. Parallel arrays (icon/name) index by
@@ -2413,7 +2403,7 @@ print_status_row() {
   if proc_running "$proc_name"; then
     printf "  ${C_GREEN}●${C_RESET} %-10s ${C_GREEN}running${C_RESET} ${C_DIM}(PID %s)${C_RESET}\n" "$label" "$(proc_pid "$proc_name")"
   else
-    printf "  ${C_DIM}○ %-10s stopped${C_RESET}\n" "$label"
+    printf "  ○ %-10s stopped\n" "$label"
   fi
 }
 
@@ -2424,7 +2414,7 @@ menu() {
     echo "  ${C_CYAN}${C_BOLD}╔══════════════════════════════════════╗${C_RESET}"
     echo "  ${C_CYAN}${C_BOLD}║      codecade.co.za — Portal TUI      ║${C_RESET}"
     echo "  ${C_CYAN}${C_BOLD}╚══════════════════════════════════════╝${C_RESET}"
-    echo "  ${C_DIM}${C_MAGENTA}✦ web · chat · games · everything, together ✦${C_RESET}"
+    echo "  ${C_CYAN}✦ web · chat · games · everything, together ✦${C_RESET}"
     echo ""
 
     print_status_row "Forge"     forge
@@ -2446,19 +2436,21 @@ menu() {
     echo ""
 
     # Tab bar: the active tab gets brackets + bold/color, inactive ones stay
-    # dim -- deliberately not width-aligned to an underline, since bash's
-    # ${#str} counts *bytes* for multi-byte icons like ⚡ under some locales
-    # and *characters* under others, which would throw off any padding math
-    # unpredictably depending on what locale this actually runs under.
-    # Bracket-wrapping needs no character counting at all, so it can't
-    # misalign no matter what.
+    # plain (not dim -- dim text is too low-contrast to read comfortably on
+    # a lot of terminal color schemes, and these are real navigation
+    # options, not throwaway detail) -- deliberately not width-aligned to an
+    # underline, since bash's ${#str} counts *bytes* for multi-byte icons
+    # like ⚡ under some locales and *characters* under others, which would
+    # throw off any padding math unpredictably depending on what locale
+    # this actually runs under. Bracket-wrapping needs no character
+    # counting at all, so it can't misalign no matter what.
     local tab_line="  "
     for t in "${!TAB_NAMES[@]}"; do
       local label="${TAB_ICONS[$t]} ${TAB_NAMES[$t]}"
       if [ "$t" -eq "$_tab_selected" ]; then
-        tab_line+="${C_MAGENTA}${C_BOLD}[ ${label} ]${C_RESET}"
+        tab_line+="${C_CYAN}${C_BOLD}[ ${label} ]${C_RESET}"
       else
-        tab_line+="${C_DIM}  ${label}  ${C_RESET}"
+        tab_line+="  ${label}  "
       fi
       tab_line+="  "
     done
@@ -2470,9 +2462,9 @@ menu() {
     local -n _current_labels="${TAB_NAMES[$_tab_selected]}_LABELS"
     for i in "${!_current_labels[@]}"; do
       if [ "$i" -eq "$_menu_selected" ]; then
-        echo "    ${C_CYAN}▸ ${_current_labels[$i]}${C_RESET}"
+        echo "    ${C_CYAN}${C_BOLD}▸ ${_current_labels[$i]}${C_RESET}"
       else
-        echo "      ${C_DIM}${_current_labels[$i]}${C_RESET}"
+        echo "      ${_current_labels[$i]}"
       fi
     done
 
