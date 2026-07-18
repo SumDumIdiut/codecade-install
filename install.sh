@@ -184,6 +184,15 @@ clone_or_update() {
     if [ -d "$dir/.git" ]; then
       warn "$name: existing checkout looks corrupted (no valid HEAD) — removing and re-cloning."
       rm -rf "$dir"
+    elif [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+      # A non-empty directory with no .git at all (e.g. leftover
+      # node_modules/downloaded-binaries from an interrupted earlier run,
+      # or setup killed mid-clone before .git even existed) -- `git clone`
+      # refuses to clone into this and exits 1 below, hard-failing the
+      # whole script before it ever reaches the TUI. Clear it first so a
+      # fresh clone always has a real shot at succeeding.
+      warn "$name: directory exists but isn't a git checkout — removing and re-cloning."
+      rm -rf "$dir"
     fi
     info "Cloning $name..."
     if run_capturing "clone-$name" git clone "$url" "$dir"; then
