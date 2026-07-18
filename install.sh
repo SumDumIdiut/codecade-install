@@ -49,8 +49,12 @@ git_safe() {
 if [ -t 1 ]; then
   C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RESET=$'\033[0m'
   C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  # Extra accents for the TUI's tab bar/header -- not used by the plain
+  # ok()/info()/warn()/err() log lines, which stay exactly as they were.
+  C_MAGENTA=$'\033[35m'; C_BLUE=$'\033[34m'; C_WHITE=$'\033[97m'
 else
   C_BOLD=''; C_DIM=''; C_RESET=''; C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''
+  C_MAGENTA=''; C_BLUE=''; C_WHITE=''
 fi
 ok()   { echo "  ${C_GREEN}✓${C_RESET} $1"; }
 info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
@@ -1784,18 +1788,20 @@ do_setup() {
     warn "tag/relay-server not found in the tag repo checkout — skipping."
   fi
 
-  # Defense-in-depth against CRLF creeping back in: temutalk's own
-  # .gitattributes now forces LF checkouts, but a drive cloned before that
-  # fix (or a checkout from a machine that ignores it for some reason) would
-  # otherwise crash bash with "$'\r': command not found" on every line.
-  [ -f "$DIR/temutalk/install.sh" ] && sed -i 's/\r$//' "$DIR/temutalk/install.sh" 2>/dev/null
+  if [ -d "$DIR/remote-admin" ]; then
+    info "Installing remote-admin dependencies..."
+    run_capturing "remote-admin-npm-install" bash -c "cd '$DIR/remote-admin' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
+      && ok "remote-admin dependencies installed."
+  else
+    warn "remote-admin not found — skipping."
+  fi
 
-  info "Running temutalk's own first-run setup (system deps, portable Node, Piper, audio, USB key)..."
-  # < /dev/null: belt-and-suspenders against temutalk/install.sh ever blocking
-  # on an interactive read — it shouldn't in "setup" mode, but a subprocess
-  # otherwise inherits our real TTY, and a stuck read here would silently
-  # hang this whole script with no obvious cause.
-  bash "$DIR/temutalk/install.sh" setup < /dev/null
+  info "Setting up temutalk (system deps, portable Node, Piper voice, USB key)..."
+  ensure_ffmpeg
+  ensure_temutalk_portable_bins
+  ensure_temutalk_npm_deps
+  ensure_temutalk_piper
+  setup_temutalk_usb_key
 
   echo ""
   ok "Setup complete."
@@ -1870,6 +1876,230 @@ start_tag_relay() {
   else snapshot_log_on_failure "tag-relay-start" "$DIR/logs/tag-relay.log"; fi
 }
 
+# Token-authenticated exec/file-transfer service -- an SSH replacement for
+# when direct SSH access to this machine is unreliable (see remote-admin.js
+# for the actual endpoints and the auth model). Binds to 127.0.0.1 only by
+# design; anything beyond that (LAN, or a Cloudflare Tunnel ingress rule) is
+# a deliberate, separate step, not something this script does for you.
+start_remote_admin() {
+  if proc_running remote-admin; then warn "remote-admin already running."; return; fi
+  if [ ! -d "$DIR/remote-admin/node_modules" ]; then warn "remote-admin/node_modules missing — run setup first."; return; fi
+  local node_bin; node_bin=$(find_node)
+  if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
+  ( cd "$DIR/remote-admin" && \
+    nohup "$node_bin" remote-admin.js > "$DIR/logs/remote-admin.log" 2>&1 & echo $! > "$(pid_file remote-admin)" )
+  sleep 1
+  if proc_running remote-admin; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
+  else snapshot_log_on_failure "remote-admin-start" "$DIR/logs/remote-admin.log"; fi
+}
+
+# ─── TemuTalk's own setup steps, merged in from what used to be a separate
+# temutalk/install.sh (deleted -- one install.sh for everything now, not one
+# per app). ffmpeg/portable-Node/cloudflared/Piper/USB-key logic below is a
+# direct port of what that script did, plus a real fix for the Piper
+# symlink bug (see ensure_temutalk_piper).
+
+ensure_ffmpeg() {
+  command -v ffmpeg >/dev/null 2>&1 && { ok "ffmpeg already installed."; return; }
+  if ! command -v apt-get >/dev/null 2>&1; then
+    warn "apt-get not found — install manually: ffmpeg"
+    return
+  fi
+  info "Installing ffmpeg (requires sudo)..."
+  local _sudo=""
+  [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _sudo="sudo"
+  if $_sudo apt-get update -qq && $_sudo apt-get install -y ffmpeg; then
+    ok "Installed ffmpeg."
+  else
+    err "ffmpeg install failed — see output above."
+  fi
+}
+
+# Portable Node.js + cloudflared for temutalk specifically (no system install
+# required) -- find_temutalk_node()/find_cloudflared() above already know to
+# look for these at $DIR/temutalk/bin/linux/*.
+ensure_temutalk_portable_bins() {
+  local arch node_arch cf_arch
+  arch=$(uname -m)
+  case "$arch" in
+    aarch64|arm64) node_arch=arm64;  cf_arch=linux-arm64 ;;
+    arm*)          node_arch=armv7l; cf_arch=linux-arm   ;;
+    *)             node_arch=x64;    cf_arch=linux-amd64 ;;
+  esac
+
+  mkdir -p "$DIR/temutalk/bin/linux"
+  if [ ! -f "$DIR/temutalk/bin/linux/node" ]; then
+    info "Downloading portable Node.js ($node_arch) for temutalk..."
+    local tarball ver
+    tarball=$(curl -sL "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt" \
+      | grep "linux-${node_arch}.tar.gz" | awk '{print $2}' | head -1)
+    if [ -z "$tarball" ]; then
+      err "Could not determine latest Node.js build."
+    else
+      curl -L --progress-bar -o "$DIR/temutalk/bin/linux/node.tar.gz" "https://nodejs.org/dist/latest-v20.x/${tarball}"
+      ver=${tarball%-linux-*}
+      tar -xzf "$DIR/temutalk/bin/linux/node.tar.gz" -C "$DIR/temutalk/bin/linux" --strip-components=2 "${ver}-linux-${node_arch}/bin/node"
+      rm -f "$DIR/temutalk/bin/linux/node.tar.gz"
+      chmod +x "$DIR/temutalk/bin/linux/node"
+      ok "Portable Node.js ready."
+    fi
+  else
+    ok "Portable Node.js already present."
+  fi
+
+  if [ ! -f "$DIR/temutalk/bin/linux/cloudflared" ]; then
+    info "Downloading cloudflared ($cf_arch) for temutalk..."
+    curl -L --progress-bar -o "$DIR/temutalk/bin/linux/cloudflared" \
+      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}"
+    chmod +x "$DIR/temutalk/bin/linux/cloudflared"
+    ok "cloudflared ready."
+  else
+    ok "cloudflared already present."
+  fi
+}
+
+ensure_temutalk_npm_deps() {
+  if [ -d "$DIR/temutalk/node_modules" ]; then
+    ok "temutalk npm dependencies already installed."
+    return
+  fi
+  local npm_bin; npm_bin=$(find_npm)
+  if [ -z "$npm_bin" ]; then
+    warn "npm not found on PATH — install Node.js/npm, then re-run setup to install temutalk's dependencies."
+    return
+  fi
+  info "Installing temutalk npm dependencies..."
+  # --no-bin-links: same reasoning as portal/git-forge/tag-relay above --
+  # this runs from a portable USB drive (usually exFAT/FAT32, which can't
+  # hold symlinks), and nothing here is launched via a bin script anyway.
+  if ( cd "$DIR/temutalk" && "$npm_bin" install --no-audit --no-fund --no-bin-links --loglevel=error ); then
+    ok "temutalk npm dependencies installed."
+  else
+    err "temutalk npm install failed — see output above."
+  fi
+}
+
+# Piper (local text-to-speech, no client install required) -- the assistant's
+# voice replies are synthesized server-side and streamed to the browser as
+# WAV, so no client device needs anything installed for voice replies to
+# work.
+ensure_temutalk_piper() {
+  local arch piper_arch
+  arch=$(uname -m)
+  case "$arch" in
+    aarch64|arm64) piper_arch=aarch64 ;;
+    arm*)          piper_arch=armv7l  ;;
+    *)             piper_arch=x86_64  ;;
+  esac
+
+  if [ ! -x "$DIR/temutalk/bin/linux/piper/piper" ]; then
+    info "Downloading Piper TTS ($piper_arch)..."
+    mkdir -p "$DIR/temutalk/bin/linux/piper"
+    curl -L --progress-bar -o /tmp/piper.tar.gz \
+      "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_${piper_arch}.tar.gz"
+    tar -xzf /tmp/piper.tar.gz -C "$DIR/temutalk/bin/linux/piper" --strip-components=1
+    rm -f /tmp/piper.tar.gz
+    # The USB drive this whole tree runs from is usually exFAT/FAT32 (cross-
+    # OS compatibility), which can't hold symlinks -- tar's extraction above
+    # silently fails to create Piper's libFOO.so -> libFOO.so.N -> libFOO.
+    # so.N.N.N link chain (the real, fully-versioned file itself extracts
+    # fine; only the link levels on top of it fail), which then breaks
+    # Piper's dynamic linking at runtime with no obvious error until you
+    # actually try to synthesize speech. Repair by copying the real file
+    # over every missing link-name level instead of relying on symlinks,
+    # the same workaround already used for npm's --no-bin-links.
+    # NOTE: globbing for the missing plain ".so" names directly (as an
+    # earlier version of this fix tried) doesn't work -- those names don't
+    # exist yet, so the glob matches nothing. Walk forward instead from
+    # each fully-versioned file that DID extract (foo.so.N.N.N), filling in
+    # every less-specific name (foo.so.N.N, foo.so.N, foo.so) that's absent.
+    local f base
+    for f in "$DIR/temutalk/bin/linux/piper/"*.so.*; do
+      [ -f "$f" ] || continue
+      base="$f"
+      while [[ "$base" =~ \.[0-9][0-9a-zA-Z]*$ ]]; do
+        base="${base%.*}"
+        [ -e "$base" ] || cp "$f" "$base"
+      done
+    done
+    chmod +x "$DIR/temutalk/bin/linux/piper/piper" "$DIR/temutalk/bin/linux/piper/piper_phonemize" 2>/dev/null
+    ok "Piper ready."
+  else
+    ok "Piper already present."
+  fi
+
+  if [ ! -f "$DIR/temutalk/voices/en_US-lessac-medium.onnx" ]; then
+    info "Downloading Piper voice (en_US-lessac-medium)..."
+    mkdir -p "$DIR/temutalk/voices"
+    curl -L --progress-bar -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx" \
+      "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
+    curl -sL -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx.json" \
+      "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
+    ok "Voice ready."
+  else
+    ok "Piper voice already present."
+  fi
+}
+
+# ─── TemuTalk's USB key security ────────────────────────────────────────────
+# Physical-USB-drive-gated access to the dev panel's remote terminal +
+# TemuTalk admin tab (see start_dev_panel below, which reads the hash this
+# writes) -- only the SHA-256 hash is stored server-side, the raw key never
+# leaves the USB drive.
+TEMUTALK_USB_LABEL="${TEMUTALK_USB_LABEL:-}"
+TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash"
+
+find_temutalk_usb_mount() {
+  local user; user=$(whoami)
+  if [ -n "$TEMUTALK_USB_LABEL" ]; then
+    local p
+    for p in "/media/$user/$TEMUTALK_USB_LABEL" "/run/media/$user/$TEMUTALK_USB_LABEL" "/mnt/$TEMUTALK_USB_LABEL" "/media/$TEMUTALK_USB_LABEL"; do
+      [ -d "$p" ] && { echo "$p"; return; }
+    done
+    return
+  fi
+  # Prefer a mounted drive that already carries a key.key, so the same
+  # logical key drive keeps being found even if the OS assigns it a
+  # different mount name after a replug/reboot; otherwise fall back to
+  # whichever removable drive is present, for first-time key generation.
+  local root d candidate=""
+  for root in "/media/$user" "/run/media/$user" "/media" "/mnt"; do
+    [ -d "$root" ] || continue
+    for d in "$root"/*/; do
+      [ -d "$d" ] || continue
+      d="${d%/}"
+      if [ -f "$d/key.key" ]; then echo "$d"; return; fi
+      [ -z "$candidate" ] && candidate="$d"
+    done
+  done
+  [ -n "$candidate" ] && echo "$candidate"
+}
+
+setup_temutalk_usb_key() {
+  if [ -f "$TEMUTALK_KEY_HASH_FILE" ] && [ -s "$TEMUTALK_KEY_HASH_FILE" ]; then
+    ok "USB key already enrolled."
+    return
+  fi
+  local usb; usb=$(find_temutalk_usb_mount)
+  if [ -z "$usb" ]; then
+    warn "USB drive not found — plug in the TemuTalk USB and run: bash install.sh enroll"
+    return
+  fi
+  local key_file="$usb/key.key"
+  if [ -f "$key_file" ]; then
+    info "Existing key found on USB — enrolling..."
+  else
+    info "Generating 1000-character key on USB..."
+    mkdir -p "$DIR/temutalk/.run"
+    tr -dc 'A-Za-z0-9+/=' < /dev/urandom 2>/dev/null | head -c 1000 > "$key_file"
+    ok "Key written to $key_file"
+  fi
+  mkdir -p "$DIR/temutalk/.run"
+  sha256sum < "$key_file" | cut -c1-64 > "$TEMUTALK_KEY_HASH_FILE"
+  chmod 600 "$TEMUTALK_KEY_HASH_FILE"
+  ok "Key hash enrolled. Dev panel now requires this USB to be plugged in."
+}
+
 # Remote terminal + TemuTalk admin panel (chat spy/moderation, devices,
 # accounts), gated behind the same physical USB key file that unlocks
 # temutalk's own control panel (reads temutalk's panel-key-hash directly
@@ -1879,7 +2109,7 @@ start_dev_panel() {
   if proc_running dev-panel; then warn "Dev panel already running."; return; fi
   if [ ! -d "$DIR/portal/node_modules" ]; then warn "portal/node_modules missing — run setup first."; return; fi
   if [ ! -f "$DIR/temutalk/.run/panel-key-hash" ]; then
-    warn "temutalk has no panel key enrolled yet — enroll the USB key via temutalk's install.sh first."
+    warn "temutalk has no panel key enrolled yet — run: bash install.sh enroll"
   fi
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
@@ -1975,19 +2205,20 @@ EOF
   else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
 }
 
-do_start() { start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_tunnel; }
-do_stop()  { stop_proc tunnel; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
+do_start() { start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel; }
+do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
 
 status_json() {
-  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false
-  proc_running forge     && forge_run=true
-  proc_running temutalk  && temutalk_run=true
-  proc_running portal    && portal_run=true
-  proc_running tunnel    && tunnel_run=true
-  proc_running tag-relay && tag_relay_run=true
-  proc_running dev-panel && dev_panel_run=true
-  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"url":"https://%s"}\n' \
-    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$CF_DOMAIN"
+  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false remote_admin_run=false
+  proc_running forge         && forge_run=true
+  proc_running temutalk      && temutalk_run=true
+  proc_running portal        && portal_run=true
+  proc_running tunnel        && tunnel_run=true
+  proc_running tag-relay     && tag_relay_run=true
+  proc_running dev-panel     && dev_panel_run=true
+  proc_running remote-admin  && remote_admin_run=true
+  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"remoteAdmin":%s,"url":"https://%s"}\n' \
+    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$remote_admin_run" "$CF_DOMAIN"
 }
 
 do_open_browser() {
@@ -2024,8 +2255,8 @@ do_check_updates() {
 do_view_logs() {
   echo "  ${C_DIM}Ctrl+C to return to the menu.${C_RESET}"
   sleep 1
-  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log errors/errors.log
-  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log errors/errors.log
+  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log logs/remote-admin.log errors/errors.log
+  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log logs/remote-admin.log errors/errors.log
 }
 
 do_view_errors() {
@@ -2048,29 +2279,32 @@ if [ "${1:-}" = "setup" ]; then do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
 if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   case "${2:-}" in
-    forge|temutalk|portal|tunnel|tag-relay|dev-panel|all) ;;
-    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|all}"; exit 1 ;;
+    forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|all) ;;
+    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|all}"; exit 1 ;;
   esac
   case "$1-$2" in
-    start-forge)     start_forge ;;
-    start-temutalk)  start_temutalk ;;
-    start-portal)    start_portal ;;
-    start-tunnel)    start_tunnel ;;
-    start-tag-relay) start_tag_relay ;;
-    start-dev-panel) start_dev_panel ;;
-    start-all)       do_start ;;
-    stop-forge)      stop_proc forge ;;
-    stop-temutalk)   stop_proc temutalk ;;
-    stop-portal)     stop_proc portal ;;
-    stop-tunnel)     stop_proc tunnel ;;
-    stop-tag-relay)  stop_proc tag-relay ;;
-    stop-dev-panel)  stop_proc dev-panel ;;
-    stop-all)        do_stop ;;
+    start-forge)         start_forge ;;
+    start-temutalk)      start_temutalk ;;
+    start-portal)        start_portal ;;
+    start-tunnel)        start_tunnel ;;
+    start-tag-relay)     start_tag_relay ;;
+    start-dev-panel)     start_dev_panel ;;
+    start-remote-admin)  start_remote_admin ;;
+    start-all)           do_start ;;
+    stop-forge)          stop_proc forge ;;
+    stop-temutalk)       stop_proc temutalk ;;
+    stop-portal)         stop_proc portal ;;
+    stop-tunnel)         stop_proc tunnel ;;
+    stop-tag-relay)      stop_proc tag-relay ;;
+    stop-dev-panel)      stop_proc dev-panel ;;
+    stop-remote-admin)   stop_proc remote-admin ;;
+    stop-all)            do_stop ;;
   esac
   exit 0
 fi
 if [ "${1:-}" = "status" ]; then status_json; exit 0; fi
 if [ "${1:-}" = "errors" ]; then do_view_errors; exit 0; fi
+if [ "${1:-}" = "enroll" ]; then setup_temutalk_usb_key; exit 0; fi
 
 # ─── First-run setup, then TUI ───────────────────────────────────────────────
 echo ""
@@ -2084,22 +2318,37 @@ warn "OAuth redirect URI changed. Update it in the Spotify Developer Dashboard:"
 echo "     ${C_CYAN}https://${CF_DOMAIN}/temutalk/callback${C_RESET}"
 warn "Spotify login will not work until this is updated."
 
-MENU_LABELS=(
+# Three subtabs instead of one long flat list -- CONTROL for whole-stack
+# actions, SERVICES for toggling one process at a time, DIAGNOSTICS for
+# everything read-only/investigative. Parallel arrays (icon/name) index by
+# tab number; each tab's own item labels live in their own array below so
+# the menu loop can look one up by name via a nameref (`local -n`).
+TAB_ICONS=("⚡" "▣" "◈")
+TAB_NAMES=("CONTROL" "SERVICES" "DIAGNOSTICS")
+
+CONTROL_LABELS=(
   "Start all"
   "Stop all"
   "Open in browser"
-  "Check for updates"
-  "View logs"
-  "View errors"
+  "Bundle to a drive..."
+  "Exit"
+)
+SERVICES_LABELS=(
   "Toggle Forge"
   "Toggle TemuTalk"
   "Toggle Portal"
   "Toggle Tunnel"
   "Toggle Tag relay"
   "Toggle Dev panel"
-  "Bundle to a drive..."
-  "Exit"
+  "Toggle Remote-admin"
 )
+DIAGNOSTICS_LABELS=(
+  "Check for updates"
+  "View logs"
+  "View errors"
+)
+
+_tab_selected=0
 _menu_selected=0
 
 # Reads one keypress, with a timeout so the menu loop periodically wakes up
@@ -2148,36 +2397,73 @@ check_for_updates_quiet() {
   done
 }
 
+# A colored "● running (PID n)" / "○ stopped" status line -- used by the
+# menu's header block below, one call per service.
+print_status_row() {
+  local label="$1" proc_name="$2"
+  if proc_running "$proc_name"; then
+    printf "  ${C_GREEN}●${C_RESET} %-10s ${C_GREEN}running${C_RESET} ${C_DIM}(PID %s)${C_RESET}\n" "$label" "$(proc_pid "$proc_name")"
+  else
+    printf "  ${C_DIM}○ %-10s stopped${C_RESET}\n" "$label"
+  fi
+}
+
 menu() {
   while true; do
     check_for_updates_quiet
     clear
-    echo "  ${C_BOLD}╔══════════════════════════════════════╗${C_RESET}"
-    echo "  ${C_BOLD}║      codecade.co.za — Portal TUI      ║${C_RESET}"
-    echo "  ${C_BOLD}╚══════════════════════════════════════╝${C_RESET}"
+    echo "  ${C_CYAN}${C_BOLD}╔══════════════════════════════════════╗${C_RESET}"
+    echo "  ${C_CYAN}${C_BOLD}║      codecade.co.za — Portal TUI      ║${C_RESET}"
+    echo "  ${C_CYAN}${C_BOLD}╚══════════════════════════════════════╝${C_RESET}"
+    echo "  ${C_DIM}${C_MAGENTA}✦ web · chat · games · everything, together ✦${C_RESET}"
     echo ""
-    proc_running forge     && echo "  Forge    : ${C_GREEN}running${C_RESET} (PID $(proc_pid forge))"     || echo "  Forge    : ${C_DIM}stopped${C_RESET}"
-    proc_running tag-relay && echo "  Tag relay: ${C_GREEN}running${C_RESET} (PID $(proc_pid tag-relay))" || echo "  Tag relay: ${C_DIM}stopped${C_RESET}"
-    proc_running temutalk  && echo "  TemuTalk : ${C_GREEN}running${C_RESET} (PID $(proc_pid temutalk))"  || echo "  TemuTalk : ${C_DIM}stopped${C_RESET}"
-    proc_running portal    && echo "  Portal   : ${C_GREEN}running${C_RESET} (PID $(proc_pid portal))"    || echo "  Portal   : ${C_DIM}stopped${C_RESET}"
-    proc_running tunnel    && echo "  Tunnel   : ${C_GREEN}running${C_RESET} (PID $(proc_pid tunnel))"     || echo "  Tunnel   : ${C_DIM}stopped${C_RESET}"
-    proc_running dev-panel && echo "  Dev panel: ${C_GREEN}running${C_RESET} (PID $(proc_pid dev-panel))" || echo "  Dev panel: ${C_DIM}stopped${C_RESET}"
-    echo "  URL      : https://${CF_DOMAIN}"
+
+    print_status_row "Forge"     forge
+    print_status_row "Tag relay" tag-relay
+    print_status_row "TemuTalk"  temutalk
+    print_status_row "Portal"    portal
+    print_status_row "Tunnel"    tunnel
+    print_status_row "Dev panel" dev-panel
+    print_status_row "Admin"     remote-admin
+    echo "  ${C_DIM}URL${C_RESET}          https://${CF_DOMAIN}"
+
     if [ "$_updates_available" -eq 1 ]; then
-      echo "  ${C_YELLOW}Updates available — select \"Check for updates\" to pull.${C_RESET}"
+      echo "  ${C_YELLOW}⚠ Updates available — see DIAGNOSTICS → Check for updates.${C_RESET}"
     fi
     local _err_count; _err_count=$(find errors -maxdepth 1 -type f 2>/dev/null | wc -l)
     if [ "$_err_count" -gt 0 ]; then
-      echo "  ${C_RED}$_err_count error file(s) recorded — select \"View errors\".${C_RESET}"
+      echo "  ${C_RED}⚠ $_err_count error file(s) recorded — see DIAGNOSTICS → View errors.${C_RESET}"
     fi
     echo ""
-    echo "  ${C_DIM}↑/↓ to move, Enter to select${C_RESET}"
-    echo ""
-    for i in "${!MENU_LABELS[@]}"; do
-      if [ "$i" -eq "$_menu_selected" ]; then
-        echo "  ${C_CYAN}▸ ${MENU_LABELS[$i]}${C_RESET}"
+
+    # Tab bar: the active tab gets brackets + bold/color, inactive ones stay
+    # dim -- deliberately not width-aligned to an underline, since bash's
+    # ${#str} counts *bytes* for multi-byte icons like ⚡ under some locales
+    # and *characters* under others, which would throw off any padding math
+    # unpredictably depending on what locale this actually runs under.
+    # Bracket-wrapping needs no character counting at all, so it can't
+    # misalign no matter what.
+    local tab_line="  "
+    for t in "${!TAB_NAMES[@]}"; do
+      local label="${TAB_ICONS[$t]} ${TAB_NAMES[$t]}"
+      if [ "$t" -eq "$_tab_selected" ]; then
+        tab_line+="${C_MAGENTA}${C_BOLD}[ ${label} ]${C_RESET}"
       else
-        echo "    ${MENU_LABELS[$i]}"
+        tab_line+="${C_DIM}  ${label}  ${C_RESET}"
+      fi
+      tab_line+="  "
+    done
+    echo "$tab_line"
+    echo ""
+    echo "  ${C_DIM}↑/↓ move   ←/→ switch tabs   Enter select   q quit${C_RESET}"
+    echo ""
+
+    local -n _current_labels="${TAB_NAMES[$_tab_selected]}_LABELS"
+    for i in "${!_current_labels[@]}"; do
+      if [ "$i" -eq "$_menu_selected" ]; then
+        echo "    ${C_CYAN}▸ ${_current_labels[$i]}${C_RESET}"
+      else
+        echo "      ${C_DIM}${_current_labels[$i]}${C_RESET}"
       fi
     done
 
@@ -2187,11 +2473,21 @@ menu() {
         continue
         ;;
       $'\x1b[A')
-        _menu_selected=$(( (_menu_selected - 1 + ${#MENU_LABELS[@]}) % ${#MENU_LABELS[@]} ))
+        _menu_selected=$(( (_menu_selected - 1 + ${#_current_labels[@]}) % ${#_current_labels[@]} ))
         continue
         ;;
       $'\x1b[B')
-        _menu_selected=$(( (_menu_selected + 1) % ${#MENU_LABELS[@]} ))
+        _menu_selected=$(( (_menu_selected + 1) % ${#_current_labels[@]} ))
+        continue
+        ;;
+      $'\x1b[D')
+        _tab_selected=$(( (_tab_selected - 1 + ${#TAB_NAMES[@]}) % ${#TAB_NAMES[@]} ))
+        _menu_selected=0
+        continue
+        ;;
+      $'\x1b[C')
+        _tab_selected=$(( (_tab_selected + 1) % ${#TAB_NAMES[@]} ))
+        _menu_selected=0
         continue
         ;;
       "") ;; # Enter -- fall through and act on the selected item
@@ -2205,26 +2501,39 @@ menu() {
     esac
 
     echo ""
-    case "$_menu_selected" in
-      0) do_start ;;
-      1) do_stop ;;
-      2) do_open_browser ;;
-      3) do_check_updates ;;
-      4) do_view_logs ;;
-      5) do_view_errors ;;
-      6) if proc_running forge;     then stop_proc forge;     else start_forge;     fi ;;
-      7) if proc_running temutalk;  then stop_proc temutalk;  else start_temutalk;  fi ;;
-      8) if proc_running portal;    then stop_proc portal;    else start_portal;    fi ;;
-      9) if proc_running tunnel;    then stop_proc tunnel;    else start_tunnel;    fi ;;
-      10) if proc_running tag-relay; then stop_proc tag-relay; else start_tag_relay; fi ;;
-      11) if proc_running dev-panel; then stop_proc dev-panel; else start_dev_panel; fi ;;
-      12)
-        read -rp "  Destination path (e.g. a mounted USB drive): " bundle_dest
-        [ -n "$bundle_dest" ] && do_bundle "$bundle_dest"
+    case "$_tab_selected" in
+      0) # CONTROL
+        case "$_menu_selected" in
+          0) do_start ;;
+          1) do_stop ;;
+          2) do_open_browser ;;
+          3)
+            read -rp "  Destination path (e.g. a mounted USB drive): " bundle_dest
+            [ -n "$bundle_dest" ] && do_bundle "$bundle_dest"
+            ;;
+          4)
+            echo "  Bye."
+            exit 0
+            ;;
+        esac
         ;;
-      13)
-        echo "  Bye."
-        exit 0
+      1) # SERVICES
+        case "$_menu_selected" in
+          0) if proc_running forge;        then stop_proc forge;        else start_forge;        fi ;;
+          1) if proc_running temutalk;     then stop_proc temutalk;     else start_temutalk;     fi ;;
+          2) if proc_running portal;       then stop_proc portal;       else start_portal;       fi ;;
+          3) if proc_running tunnel;       then stop_proc tunnel;       else start_tunnel;       fi ;;
+          4) if proc_running tag-relay;    then stop_proc tag-relay;    else start_tag_relay;    fi ;;
+          5) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
+          6) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
+        esac
+        ;;
+      2) # DIAGNOSTICS
+        case "$_menu_selected" in
+          0) do_check_updates ;;
+          1) do_view_logs ;;
+          2) do_view_errors ;;
+        esac
         ;;
     esac
     echo ""
