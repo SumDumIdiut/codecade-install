@@ -24,6 +24,12 @@ set -uo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 cd "$DIR" || exit 1
+# Portable Node.js/cloudflared/ffmpeg (see ensure_portable_node etc below)
+# live in .bin -- putting it on PATH here, once, means every nohup'd service
+# below and anything they shell out to (e.g. temutalk invoking ffmpeg) finds
+# them automatically, without threading find_node()/find_ffmpeg() through
+# every call site individually.
+export PATH="$DIR/.bin:$PATH"
 
 TEMUTALK_REPO="https://github.com/SumDumIdiut/temutalk.git"
 FORGE_REPO="https://github.com/SumDumIdiut/git-forge.git"
@@ -118,6 +124,122 @@ self_update() {
     rm -rf "$tmpdir" 2>/dev/null
   fi
 }
+
+# ─── Platform detection ─────────────────────────────────────────────────────
+# This script's primary target is a Linux server (terraserver), but it's also
+# routinely run via Git Bash on Windows during development -- every portable
+# download below (Node.js, cloudflared, ffmpeg) and the git-install fallback
+# need an OS branch, not just a CPU-arch one.
+detect_os() {
+  case "$(uname -s)" in
+    Linux*)                echo linux ;;
+    Darwin*)                echo darwin ;;
+    MINGW*|MSYS*|CYGWIN*)  echo windows ;;
+    *)                      echo linux ;;
+  esac
+}
+
+# Extracts a .zip whose contents sit inside one top-level directory straight
+# into $dest, stripping that top-level directory -- the same thing tar
+# --strip-components=1 does for the .tar.gz/.tar.xz archives used elsewhere
+# in this script. Needed because Git for Windows' bundled `tar` genuinely
+# cannot read zip (confirmed live: "This does not look like a tar archive"
+# on a real Node.js Windows zip -- it is NOT the bsdtar/libarchive build that
+# some other MSYS2 distributions ship), whereas `unzip` is present in every
+# Git for Windows install tested.
+extract_zip_stripped() {
+  local archive="$1" dest="$2"
+  local tmp; tmp="$(mktemp -d 2>/dev/null)" || tmp="$DIR/.bin/.unzip-tmp-$$"
+  mkdir -p "$tmp"
+  if ! unzip -q "$archive" -d "$tmp"; then rm -rf "$tmp"; return 1; fi
+  local root; root=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
+  if [ -z "$root" ]; then rm -rf "$tmp"; return 1; fi
+  mkdir -p "$dest"
+  cp -r "$root/." "$dest/"
+  rm -rf "$tmp"
+}
+
+# Every download in this script goes through one of these two, so a slow or
+# dead mirror (confirmed live: gyan.dev hung for 6+ minutes with zero
+# progress on one run) can never hang the whole setup indefinitely -- it
+# times out, the caller's `&&` chain fails, and the (already-required)
+# fallback/soft-fail path takes over instead.
+dl_curl()        { curl -L --progress-bar --connect-timeout 15 --max-time 300 "$@"; }
+dl_curl_silent() { curl -sL --connect-timeout 15 --max-time 60  "$@"; }
+
+# ─── System package installs (git, and ffmpeg's package-manager fallback) ───
+# Everything else this script needs (Node.js, npm, cloudflared, Piper) is a
+# portable static download with no root/package-manager involved at all --
+# see ensure_portable_node/ensure_temutalk_portable_bins/ensure_temutalk_piper
+# below. git is the one exception: unlike those, there's no single portable
+# static git build to download (git itself needs a real install, with its
+# libexec helpers and shared libs), and self_update() above already needs a
+# working `git` just to fetch this script in the non-checkout branch -- so
+# "nothing pre-installed" for git means "installed automatically by this
+# script via whatever package manager the host already has", not a bundled
+# binary. Covers every mainstream Linux package manager, plus Windows
+# (choco/winget/scoop) and macOS (brew) -- not just apt.
+pkg_install() {
+  local pkg="$1"
+  local _sudo=""
+  [ "$(id -u 2>/dev/null)" != "0" ] && command -v sudo >/dev/null 2>&1 && _sudo="sudo"
+  if command -v apt-get >/dev/null 2>&1; then
+    $_sudo apt-get update -qq && $_sudo apt-get install -y "$pkg"
+  elif command -v dnf >/dev/null 2>&1; then
+    $_sudo dnf install -y "$pkg"
+  elif command -v yum >/dev/null 2>&1; then
+    $_sudo yum install -y "$pkg"
+  elif command -v pacman >/dev/null 2>&1; then
+    $_sudo pacman -Sy --noconfirm "$pkg"
+  elif command -v apk >/dev/null 2>&1; then
+    $_sudo apk add --no-cache "$pkg"
+  elif command -v zypper >/dev/null 2>&1; then
+    $_sudo zypper install -y "$pkg"
+  elif command -v emerge >/dev/null 2>&1; then
+    $_sudo emerge "$pkg"
+  elif command -v xbps-install >/dev/null 2>&1; then
+    $_sudo xbps-install -Sy "$pkg"
+  elif command -v brew >/dev/null 2>&1; then
+    brew install "$pkg"
+  elif command -v choco >/dev/null 2>&1; then
+    choco install -y "$pkg"
+  elif command -v winget >/dev/null 2>&1; then
+    winget install -e --id "$pkg" --accept-package-agreements --accept-source-agreements
+  elif command -v scoop >/dev/null 2>&1; then
+    scoop install "$pkg"
+  else
+    return 127
+  fi
+}
+
+# Package name for `pkg_install git` differs across Windows package managers
+# (winget/choco use their own catalog IDs, not the plain "git" every Linux
+# manager and brew accept).
+pkg_install_git() {
+  if [ "$(detect_os)" = "windows" ]; then
+    if command -v choco >/dev/null 2>&1; then choco install -y git; return; fi
+    if command -v winget >/dev/null 2>&1; then winget install -e --id Git.Git --accept-package-agreements --accept-source-agreements; return; fi
+    if command -v scoop >/dev/null 2>&1; then scoop install git; return; fi
+    return 127
+  fi
+  pkg_install git
+}
+
+ensure_git() {
+  command -v git >/dev/null 2>&1 && return
+  # Git Bash *is* Git for Windows -- if this script is even running (it needs
+  # bash), a working git is already on PATH in the overwhelming majority of
+  # real cases. This only fires for the rare setup where bash exists without
+  # it (e.g. a bare MSYS2 install).
+  info "git not found — installing (requires a supported package manager)..."
+  if pkg_install_git && command -v git >/dev/null 2>&1; then
+    ok "git installed."
+  else
+    err "Could not install git automatically — no supported package manager found, or it failed. Install git manually and re-run."
+    exit 1
+  fi
+}
+ensure_git
 self_update "$@"
 
 mkdir -p logs .run errors
@@ -205,15 +327,29 @@ clone_or_update() {
 }
 
 # ─── Binary/tool lookup ──────────────────────────────────────────────────────
-find_node()       { command -v node 2>/dev/null; }
-find_npm()        { command -v npm  2>/dev/null; }
-# temutalk bundles its own portable Node (no system install required) — prefer
-# that one for running temutalk specifically, matching its own install.sh.
-find_temutalk_node() {
-  [ -x "$DIR/temutalk/bin/linux/node" ] && { echo "$DIR/temutalk/bin/linux/node"; return; }
-  find_node
+# $DIR/.bin/node-runtime/ is a full portable Node.js runtime this script
+# downloads itself (see ensure_portable_node) — shared by every app (portal,
+# git-forge, tag-relay, remote-admin, temutalk), not just temutalk, so
+# nothing needs a system-wide Node.js install. $DIR/.bin/node itself is a
+# flat wrapper script (not the runtime dir — kept separate so it can sit
+# directly on PATH, see the `export PATH` near the top of this file) that
+# execs into node-runtime/, same idea as the $DIR/.bin/npm wrapper below it.
+# System node/npm are only ever a fallback, for hosts where someone already
+# has it and the portable download hasn't run.
+find_node() {
+  [ -x "$DIR/.bin/node" ] && { echo "$DIR/.bin/node"; return; }
+  command -v node 2>/dev/null
 }
+find_npm() {
+  [ -x "$DIR/.bin/npm" ] && { echo "$DIR/.bin/npm"; return; }
+  command -v npm 2>/dev/null
+}
+# Old name kept as an alias -- temutalk used to bundle its own separate
+# portable Node before the download was generalized to the whole stack.
+find_temutalk_node() { find_node; }
 find_cloudflared() {
+  [ -x "$DIR/.bin/cloudflared" ] && { echo "$DIR/.bin/cloudflared"; return; }
+  [ -x "$DIR/.bin/cloudflared.exe" ] && { echo "$DIR/.bin/cloudflared.exe"; return; }
   [ -x "$DIR/temutalk/bin/linux/cloudflared" ] && { echo "$DIR/temutalk/bin/linux/cloudflared"; return; }
   command -v cloudflared 2>/dev/null
 }
@@ -1770,9 +1906,15 @@ do_setup() {
   # it out directly, so it's fully reproducible from this script alone.
   write_portal_files
 
+  # Portable Node.js/npm first — every app below (portal, git-forge,
+  # tag-relay, remote-admin, temutalk) needs it, and this is the one thing
+  # that has to exist before find_npm() can find anything.
+  ensure_portable_node
+  ensure_portable_cloudflared
+
   local npm_bin; npm_bin=$(find_npm)
   if [ -z "$npm_bin" ]; then
-    err "npm not found on PATH — install Node.js/npm to set up the portal and git-forge."
+    err "npm not found — portable Node.js download must have failed (see errors/ above)."
     exit 1
   fi
 
@@ -1806,9 +1948,8 @@ do_setup() {
     warn "remote-admin not found — skipping."
   fi
 
-  info "Setting up temutalk (system deps, portable Node, Piper voice, USB key)..."
+  info "Setting up temutalk (ffmpeg, Piper voice, USB key)..."
   ensure_ffmpeg
-  ensure_temutalk_portable_bins
   ensure_temutalk_npm_deps
   ensure_temutalk_piper
   setup_temutalk_usb_key
@@ -1844,7 +1985,13 @@ do_bundle() {
   info "Copying install.sh -> $dest/install.sh"
   cp "$DIR/install.sh" "$dest/install.sh"
 
-  for name in temutalk git-forge tag; do
+  # temutalk/git-forge/tag are git checkouts; portal/remote-admin/.bin aren't
+  # (portal is install.sh-generated, remote-admin lives directly in this
+  # repo, .bin is the portable Node/cloudflared/ffmpeg downloads) -- all six
+  # need to travel with the bundle for the destination to actually be
+  # self-contained, not just the three git repos.
+  for name in temutalk git-forge tag portal remote-admin .bin; do
+    [ -d "$DIR/$name" ] || continue
     info "Copying $name -> $dest/$name (this can take a while)..."
     if [ "$use_rsync" -eq 1 ]; then
       mkdir -p "$dest/$name"
@@ -1909,63 +2056,181 @@ start_remote_admin() {
 # direct port of what that script did, plus a real fix for the Piper
 # symlink bug (see ensure_temutalk_piper).
 
+# Static build (no root, no package manager) -- johnvansickle.com for Linux,
+# gyan.dev's "essentials" build (a stable always-latest URL, by design meant
+# for exactly this kind of automation) for Windows. Same "download once, no
+# system deps" approach as Node.js/cloudflared/Piper below. Falls back to the
+# host's package manager only if the download fails (offline mirror, etc) --
+# no such fallback exists on Windows, so a failure there just stays a warning
+# (ffmpeg is optional: only temutalk's audio features need it).
 ensure_ffmpeg() {
   command -v ffmpeg >/dev/null 2>&1 && { ok "ffmpeg already installed."; return; }
-  if ! command -v apt-get >/dev/null 2>&1; then
-    warn "apt-get not found — install manually: ffmpeg"
+  local ffmpeg_bin_name="ffmpeg"; [ "$(detect_os)" = "windows" ] && ffmpeg_bin_name="ffmpeg.exe"
+  if [ -x "$DIR/.bin/$ffmpeg_bin_name" ]; then ok "Portable ffmpeg already present."; return; fi
+
+  local os arch ff_arch
+  os=$(detect_os)
+  arch=$(uname -m)
+  mkdir -p "$DIR/.bin"
+  local tmp; tmp="$(mktemp -d 2>/dev/null)" || tmp="$DIR/.bin/.ffmpeg-dl-$$"
+  mkdir -p "$tmp"
+
+  if [ "$os" = "windows" ]; then
+    info "Downloading portable ffmpeg (Windows)..."
+    if dl_curl -o "$tmp/ffmpeg.zip" \
+         "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" \
+       && extract_zip_stripped "$tmp/ffmpeg.zip" "$tmp/extracted" \
+       && cp "$tmp/extracted/bin/ffmpeg.exe" "$DIR/.bin/ffmpeg.exe"; then
+      rm -rf "$tmp"
+      ok "Portable ffmpeg ready."
+      return
+    fi
+    rm -rf "$tmp"
+    warn "Portable ffmpeg download failed — no package-manager fallback on Windows. Skipping (only affects temutalk audio features)."
     return
   fi
-  info "Installing ffmpeg (requires sudo)..."
-  local _sudo=""
-  [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && _sudo="sudo"
-  if $_sudo apt-get update -qq && $_sudo apt-get install -y ffmpeg; then
-    ok "Installed ffmpeg."
+
+  case "$arch" in
+    aarch64|arm64) ff_arch=arm64  ;;
+    armv7*|armhf)  ff_arch=armhf  ;;
+    *)             ff_arch=amd64  ;;
+  esac
+  info "Downloading portable ffmpeg ($ff_arch)..."
+  if dl_curl -o "$tmp/ffmpeg.tar.xz" \
+       "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${ff_arch}-static.tar.xz" \
+     && tar -xJf "$tmp/ffmpeg.tar.xz" -C "$tmp" \
+     && cp "$tmp"/ffmpeg-*-static/ffmpeg "$DIR/.bin/ffmpeg"; then
+    chmod +x "$DIR/.bin/ffmpeg"
+    rm -rf "$tmp"
+    ok "Portable ffmpeg ready."
+    return
+  fi
+  rm -rf "$tmp"
+
+  warn "Portable ffmpeg download failed — falling back to the system package manager."
+  if pkg_install ffmpeg && command -v ffmpeg >/dev/null 2>&1; then
+    ok "Installed ffmpeg via package manager."
   else
-    err "ffmpeg install failed — see output above."
+    err "Could not install ffmpeg (portable download and package manager both failed)."
   fi
 }
+find_ffmpeg() {
+  [ -x "$DIR/.bin/ffmpeg" ] && { echo "$DIR/.bin/ffmpeg"; return; }
+  [ -x "$DIR/.bin/ffmpeg.exe" ] && { echo "$DIR/.bin/ffmpeg.exe"; return; }
+  command -v ffmpeg 2>/dev/null
+}
 
-# Portable Node.js + cloudflared for temutalk specifically (no system install
-# required) -- find_temutalk_node()/find_cloudflared() above already know to
-# look for these at $DIR/temutalk/bin/linux/*.
-ensure_temutalk_portable_bins() {
-  local arch node_arch cf_arch
+# Portable Node.js runtime shared by every app in the stack (portal,
+# git-forge, tag-relay, remote-admin, temutalk) -- no system Node.js/npm
+# install required, on Linux or Windows. Extracts the FULL upstream archive
+# (not just the node binary) because npm itself lives alongside it --
+# lib/node_modules/npm/ on Linux, node_modules/npm/ on Windows.
+ensure_portable_node() {
+  if [ -x "$DIR/.bin/node" ] && [ -x "$DIR/.bin/npm" ]; then
+    ok "Portable Node.js already present."
+    return
+  fi
+  local os arch node_arch
+  os=$(detect_os)
   arch=$(uname -m)
   case "$arch" in
-    aarch64|arm64) node_arch=arm64;  cf_arch=linux-arm64 ;;
-    arm*)          node_arch=armv7l; cf_arch=linux-arm   ;;
-    *)             node_arch=x64;    cf_arch=linux-amd64 ;;
+    aarch64|arm64) node_arch=arm64  ;;
+    arm*)          node_arch=armv7l ;;
+    *)             node_arch=x64    ;;
   esac
+  # Node has no 32-bit-ARM Windows build -- best-effort fall back to arm64.
+  [ "$os" = "windows" ] && [ "$node_arch" = "armv7l" ] && node_arch=arm64
 
-  mkdir -p "$DIR/temutalk/bin/linux"
-  if [ ! -f "$DIR/temutalk/bin/linux/node" ]; then
-    info "Downloading portable Node.js ($node_arch) for temutalk..."
-    local tarball ver
-    tarball=$(curl -sL "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt" \
-      | grep "linux-${node_arch}.tar.gz" | awk '{print $2}' | head -1)
-    if [ -z "$tarball" ]; then
-      err "Could not determine latest Node.js build."
-    else
-      curl -L --progress-bar -o "$DIR/temutalk/bin/linux/node.tar.gz" "https://nodejs.org/dist/latest-v20.x/${tarball}"
-      ver=${tarball%-linux-*}
-      tar -xzf "$DIR/temutalk/bin/linux/node.tar.gz" -C "$DIR/temutalk/bin/linux" --strip-components=2 "${ver}-linux-${node_arch}/bin/node"
-      rm -f "$DIR/temutalk/bin/linux/node.tar.gz"
-      chmod +x "$DIR/temutalk/bin/linux/node"
-      ok "Portable Node.js ready."
-    fi
+  mkdir -p "$DIR/.bin"
+  rm -rf "$DIR/.bin/node-runtime"
+  mkdir -p "$DIR/.bin/node-runtime"
+
+  local platform_tag archive_ext node_bin_path npm_cli_path
+  if [ "$os" = "windows" ]; then
+    platform_tag="win-${node_arch}"; archive_ext="zip"
+    node_bin_path="$DIR/.bin/node-runtime/node.exe"
+    npm_cli_path="$DIR/.bin/node-runtime/node_modules/npm/bin/npm-cli.js"
   else
-    ok "Portable Node.js already present."
+    platform_tag="linux-${node_arch}"; archive_ext="tar.gz"
+    node_bin_path="$DIR/.bin/node-runtime/bin/node"
+    npm_cli_path="$DIR/.bin/node-runtime/lib/node_modules/npm/bin/npm-cli.js"
   fi
 
-  if [ ! -f "$DIR/temutalk/bin/linux/cloudflared" ]; then
-    info "Downloading cloudflared ($cf_arch) for temutalk..."
-    curl -L --progress-bar -o "$DIR/temutalk/bin/linux/cloudflared" \
-      "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}"
-    chmod +x "$DIR/temutalk/bin/linux/cloudflared"
-    ok "cloudflared ready."
-  else
-    ok "cloudflared already present."
+  info "Downloading portable Node.js ($platform_tag)..."
+  local tarball
+  tarball=$(dl_curl_silent "https://nodejs.org/dist/latest-v20.x/SHASUMS256.txt" \
+    | grep "${platform_tag}\.${archive_ext}$" | awk '{print $2}' | head -1)
+  if [ -z "$tarball" ]; then
+    err "Could not determine latest Node.js build for $platform_tag."
+    return
   fi
+  dl_curl -o "$DIR/.bin/node.archive" "https://nodejs.org/dist/latest-v20.x/${tarball}"
+  if [ "$archive_ext" = "zip" ]; then
+    extract_zip_stripped "$DIR/.bin/node.archive" "$DIR/.bin/node-runtime"
+  else
+    tar -xzf "$DIR/.bin/node.archive" -C "$DIR/.bin/node-runtime" --strip-components=1
+  fi
+  rm -f "$DIR/.bin/node.archive"
+  chmod +x "$node_bin_path" 2>/dev/null
+
+  # bin/node and bin/npm inside the extracted tree are frequently symlinks
+  # (npm always is: bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js) --
+  # exFAT/FAT32 (this whole tree is designed to run from a portable USB
+  # drive) can't hold symlinks, so tar silently drops them. Write real
+  # wrapper scripts directly on $DIR/.bin (already on PATH, see the `export
+  # PATH` near the top of this file) instead of relying on the extracted
+  # tree's own links -- same fix already applied to Piper's .so link chain
+  # below, and it sidesteps needing to know whether Windows' own npm/npm.cmd
+  # wrappers extracted correctly too.
+  cat > "$DIR/.bin/node" <<NODE_WRAPPER
+#!/bin/sh
+exec "$node_bin_path" "\$@"
+NODE_WRAPPER
+  chmod +x "$DIR/.bin/node"
+
+  cat > "$DIR/.bin/npm" <<NPM_WRAPPER
+#!/bin/sh
+exec "$node_bin_path" "$npm_cli_path" "\$@"
+NPM_WRAPPER
+  chmod +x "$DIR/.bin/npm"
+  ok "Portable Node.js ready."
+}
+
+ensure_portable_cloudflared() {
+  local os cf_bin_name; os=$(detect_os)
+  cf_bin_name="cloudflared"; [ "$os" = "windows" ] && cf_bin_name="cloudflared.exe"
+  if [ -x "$DIR/.bin/$cf_bin_name" ]; then ok "cloudflared already present."; return; fi
+
+  local arch cf_arch
+  arch=$(uname -m)
+  if [ "$os" = "windows" ]; then
+    case "$arch" in
+      aarch64|arm64) cf_arch=windows-arm64 ;;
+      *)             cf_arch=windows-amd64 ;;
+    esac
+  else
+    case "$arch" in
+      aarch64|arm64) cf_arch=linux-arm64 ;;
+      arm*)          cf_arch=linux-arm   ;;
+      *)             cf_arch=linux-amd64 ;;
+    esac
+  fi
+  info "Downloading cloudflared ($cf_arch)..."
+  mkdir -p "$DIR/.bin"
+  local suffix=""; [ "$os" = "windows" ] && suffix=".exe"
+  dl_curl -o "$DIR/.bin/${cf_bin_name}" \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-${cf_arch}${suffix}"
+  chmod +x "$DIR/.bin/${cf_bin_name}"
+  ok "cloudflared ready."
+}
+
+# Kept as an alias -- this used to download node+cloudflared into
+# temutalk/bin/linux/ specifically, before both were generalized into shared,
+# stack-wide $DIR/.bin/ downloads used by every app (see ensure_portable_node
+# and ensure_portable_cloudflared above).
+ensure_temutalk_portable_bins() {
+  ensure_portable_node
+  ensure_portable_cloudflared
 }
 
 ensure_temutalk_npm_deps() {
@@ -1975,7 +2240,7 @@ ensure_temutalk_npm_deps() {
   fi
   local npm_bin; npm_bin=$(find_npm)
   if [ -z "$npm_bin" ]; then
-    warn "npm not found on PATH — install Node.js/npm, then re-run setup to install temutalk's dependencies."
+    warn "npm not found — portable Node.js download must have failed (see errors/ above). Re-run setup once that's resolved."
     return
   fi
   info "Installing temutalk npm dependencies..."
@@ -2005,7 +2270,7 @@ ensure_temutalk_piper() {
   if [ ! -x "$DIR/temutalk/bin/linux/piper/piper" ]; then
     info "Downloading Piper TTS ($piper_arch)..."
     mkdir -p "$DIR/temutalk/bin/linux/piper"
-    curl -L --progress-bar -o /tmp/piper.tar.gz \
+    dl_curl -o /tmp/piper.tar.gz \
       "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_linux_${piper_arch}.tar.gz"
     tar -xzf /tmp/piper.tar.gz -C "$DIR/temutalk/bin/linux/piper" --strip-components=1
     rm -f /tmp/piper.tar.gz
@@ -2041,9 +2306,9 @@ ensure_temutalk_piper() {
   if [ ! -f "$DIR/temutalk/voices/en_US-lessac-medium.onnx" ]; then
     info "Downloading Piper voice (en_US-lessac-medium)..."
     mkdir -p "$DIR/temutalk/voices"
-    curl -L --progress-bar -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx" \
+    dl_curl -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx" \
       "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
-    curl -sL -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx.json" \
+    dl_curl_silent -o "$DIR/temutalk/voices/en_US-lessac-medium.onnx.json" \
       "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
     ok "Voice ready."
   else
