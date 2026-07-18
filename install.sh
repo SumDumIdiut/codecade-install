@@ -139,6 +139,22 @@ detect_os() {
   esac
 }
 
+# Converts a Git-Bash POSIX-style path (/e/foo/bar) to the native Windows
+# form (E:\foo\bar). MSYS auto-converts POSIX-looking arguments passed
+# directly on a native .exe's command line, but NOT paths written into a
+# config FILE that exe reads later -- confirmed live: cloudflared.exe
+# refused a perfectly real, intact credentials file with "doesn't exist or
+# is not a file" because config.yml's credentials-file: line still had the
+# unconverted /e/... path in it. No-op on non-Windows.
+to_native_path() {
+  local p="$1"
+  if [ "$(detect_os)" = "windows" ] && [[ "$p" =~ ^/([a-zA-Z])/(.*)$ ]]; then
+    p="${BASH_REMATCH[1]^^}:/${BASH_REMATCH[2]}"
+    p="${p//\//\\}"
+  fi
+  echo "$p"
+}
+
 # Extracts a .zip whose contents sit inside one top-level directory straight
 # into $dest, stripping that top-level directory -- the same thing tar
 # --strip-components=1 does for the .tar.gz/.tar.xz archives used elsewhere
@@ -365,20 +381,37 @@ clone_or_update() {
 # execs into node-runtime/, same idea as the $DIR/.bin/npm wrapper below it.
 # System node/npm are only ever a fallback, for hosts where someone already
 # has it and the portable download hasn't run.
+# -s (non-empty), not just -x: a 0-byte wrapper (confirmed live -- USB write
+# corruption truncated one mid-session) would otherwise pass an -x-only
+# check and get trusted, silently falling every service back to whatever
+# system Node happens to be on PATH instead of the pinned portable one --
+# which, unlike the portable v20, can be strict enough (v24 confirmed live)
+# about package.json validation to crash on node_modules that were fine
+# under the portable runtime. Silent version-mismatch fallback is worse than
+# just falling back cleanly, so this check exists specifically to catch it.
 find_node() {
-  [ -x "$DIR/.bin/node" ] && { echo "$DIR/.bin/node"; return; }
+  [ -s "$DIR/.bin/node" ] && { echo "$DIR/.bin/node"; return; }
   command -v node 2>/dev/null
 }
 find_npm() {
-  [ -x "$DIR/.bin/npm" ] && { echo "$DIR/.bin/npm"; return; }
+  [ -s "$DIR/.bin/npm" ] && { echo "$DIR/.bin/npm"; return; }
   command -v npm 2>/dev/null
 }
 # Old name kept as an alias -- temutalk used to bundle its own separate
 # portable Node before the download was generalized to the whole stack.
 find_temutalk_node() { find_node; }
 find_cloudflared() {
-  [ -x "$DIR/.bin/cloudflared" ] && { echo "$DIR/.bin/cloudflared"; return; }
-  [ -x "$DIR/.bin/cloudflared.exe" ] && { echo "$DIR/.bin/cloudflared.exe"; return; }
+  # Check the OS-correct name first, not just "whichever exists" -- a
+  # leftover Linux binary from a previous run on a different machine
+  # (confirmed live: a stale .bin/cloudflared from terraserver) would
+  # otherwise get picked over a perfectly good .bin/cloudflared.exe sitting
+  # right next to it, and "cannot execute binary file" doesn't make it
+  # obvious why.
+  if [ "$(detect_os)" = "windows" ]; then
+    [ -s "$DIR/.bin/cloudflared.exe" ] && { echo "$DIR/.bin/cloudflared.exe"; return; }
+  else
+    [ -s "$DIR/.bin/cloudflared" ] && { echo "$DIR/.bin/cloudflared"; return; }
+  fi
   [ -x "$DIR/temutalk/bin/linux/cloudflared" ] && { echo "$DIR/temutalk/bin/linux/cloudflared"; return; }
   command -v cloudflared 2>/dev/null
 }
@@ -2191,7 +2224,16 @@ ensure_portable_node() {
   # wrapper scripts below always get rewritten regardless (cheap, and self-
   # heals a wrapper that baked in a stale absolute path from a previous
   # machine/mount point, like the one above describes).
-  if [ -x "$node_bin_path" ] && [ -f "$npm_cli_path" ]; then
+  #
+  # -s (non-empty), not just -x/-f: a truncated-to-0-bytes node.exe or
+  # npm-cli.js (confirmed live -- the same USB-write-corruption failure mode
+  # documented elsewhere in this file) would otherwise pass an existence
+  # check and get silently treated as "already present", so every service
+  # falls back through find_node() to whatever system Node happens to be on
+  # PATH -- which, unlike the pinned portable v20, can be a version (v24
+  # confirmed live) strict enough about package.json validation to hard-crash
+  # on node_modules that were perfectly fine under the portable runtime.
+  if [ -s "$node_bin_path" ] && [ -s "$npm_cli_path" ]; then
     :
   else
     info "Downloading portable Node.js ($platform_tag)..."
@@ -2497,7 +2539,7 @@ write_tunnel_config() {
   _TUNNEL_CONFIG_FILE="$cf_dir/config.yml"
   cat > "$_TUNNEL_CONFIG_FILE" <<EOF
 tunnel: ${tunnel_id}
-credentials-file: ${json}
+credentials-file: $(to_native_path "$json")
 ingress:
   - hostname: ${CF_DOMAIN}
     service: http://localhost:${PORTAL_PORT}
@@ -2528,8 +2570,8 @@ EOF
     args=(tunnel --config "$ingress_cfg" run --token "$token")
   else
     local cert_file="$DIR/temutalk/.cloudflared/cert.pem"
-    [ -f "$cert_file" ] && args+=(--origincert "$cert_file")
-    args+=(--config "$_TUNNEL_CONFIG_FILE" tunnel run)
+    [ -f "$cert_file" ] && args+=(--origincert "$(to_native_path "$cert_file")")
+    args+=(--config "$(to_native_path "$_TUNNEL_CONFIG_FILE")" tunnel run)
   fi
   nohup "$cf_bin" "${args[@]}" > "$DIR/logs/tunnel.log" 2>&1 &
   echo $! > "$(pid_file tunnel)"
@@ -2538,7 +2580,17 @@ EOF
   else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
 }
 
-do_start() { clear_error_logs; start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel; }
+do_start() {
+  clear_error_logs
+  # Cheap existence+size checks (see ensure_portable_node/find_node) -- only
+  # actually re-downloads if the portable runtime is genuinely missing or
+  # was truncated since the last setup/start, so a corrupted state repairs
+  # itself here instead of every service silently falling back to whatever
+  # (potentially incompatible) system Node happens to be on PATH.
+  ensure_portable_node
+  ensure_portable_cloudflared
+  start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
+}
 do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
 
 status_json() {
