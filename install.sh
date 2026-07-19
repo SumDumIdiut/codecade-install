@@ -2512,7 +2512,7 @@ start_temutalk() {
   if [ ! -d "$DIR/temutalk/node_modules" ]; then warn "temutalk/node_modules missing — run setup first."; return; fi
   local node_bin; node_bin=$(find_temutalk_node)
   if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
-  ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
+  ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
     nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo $! > "$(pid_file temutalk)" )
   sleep 2
   if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
@@ -2602,13 +2602,22 @@ EOF
 
 do_start() {
   clear_error_logs
-  # Cheap existence+size checks (see ensure_portable_node/find_node) -- only
-  # actually re-downloads if the portable runtime is genuinely missing or
-  # was truncated since the last setup/start, so a corrupted state repairs
-  # itself here instead of every service silently falling back to whatever
-  # (potentially incompatible) system Node happens to be on PATH.
-  ensure_portable_node
-  ensure_portable_cloudflared
+  # Only call ensure_portable_node/ensure_portable_cloudflared at all when
+  # the runtime isn't already known-good -- once node/npm/cloudflared are
+  # confirmed present (the same -s non-empty check find_node/find_npm/
+  # find_cloudflared use), skip them entirely instead of re-running their
+  # presence check on every single start. Self-healing still applies: if a
+  # wrapper was truncated or is genuinely missing since the last start,
+  # this still catches it and repairs it before anything launches, so
+  # services never silently fall back to whatever (potentially
+  # incompatible) system Node happens to be on PATH.
+  if [ ! -s "$DIR/.bin/node" ] || [ ! -s "$DIR/.bin/npm" ]; then
+    ensure_portable_node
+  fi
+  local cf_bin_name="cloudflared"; [ "$(detect_os)" = "windows" ] && cf_bin_name="cloudflared.exe"
+  if [ ! -s "$DIR/.bin/$cf_bin_name" ]; then
+    ensure_portable_cloudflared
+  fi
   start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
 do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
