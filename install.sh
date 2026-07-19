@@ -10,6 +10,9 @@
 #   bash install.sh start all      non-interactive start (used by the TUI itself)
 #   bash install.sh status         JSON status snapshot
 #   bash install.sh errors         show error.log (single flat file, whole tree)
+#   bash install.sh check-updates  pull temutalk/git-forge/tag, but only restart
+#                                   whichever of those actually had a new commit
+#                                   (says so plainly if nothing changed)
 #   bash install.sh bundle <dest>  copy install.sh + all repos to <dest> (e.g. a
 #                                   mounted USB drive) so it can be plugged into
 #                                   any machine and run without needing network
@@ -446,7 +449,24 @@ proc_pid() {
 stop_proc() {
   local name="$1"
   if proc_running "$name"; then
-    kill "$(proc_pid "$name")" 2>/dev/null
+    local pid; pid=$(proc_pid "$name")
+    kill "$pid" 2>/dev/null
+    # Wait for the process to actually exit (and so release its port)
+    # before returning -- confirmed live: a caller that stops a service and
+    # immediately starts a new one (do_check_updates) can otherwise race
+    # the OS's socket cleanup and hit EADDRINUSE, because SIGTERM isn't
+    # instantaneous and this used to return as soon as the signal was
+    # merely sent, not once the process was actually gone. Escalates to
+    # SIGKILL if it hasn't exited after 5s.
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 0.2
+      waited=$((waited + 1))
+      if [ "$waited" -ge 25 ]; then
+        kill -9 "$pid" 2>/dev/null
+        break
+      fi
+    done
     rm -f "$(pid_file "$name")"
     ok "$name stopped."
   else
@@ -2685,22 +2705,64 @@ do_open_browser() {
   fi
 }
 
+# Checks each repo's local HEAD against its own SHA *before* pulling
+# anything, so this can report "no updates" truthfully and only touch
+# (npm install + restart) the specific services whose repo actually moved
+# -- previously this pulled/npm-installed/prompted-to-restart-all-three
+# unconditionally, every single time, even when nothing had changed.
 do_check_updates() {
   info "Checking temutalk, git-forge and tag for updates..."
-  clone_or_update temutalk "$TEMUTALK_REPO" temutalk
-  clone_or_update git-forge "$FORGE_REPO" git-forge
-  clone_or_update tag "$TAG_REPO" tag
+  local changed_temutalk=0 changed_forge=0 changed_tag=0
+
+  local name before
+  for name in temutalk git-forge tag; do
+    before=""
+    if [ -d "$DIR/$name/.git" ] && git_safe "$DIR/$name" rev-parse HEAD >/dev/null 2>&1; then
+      before=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
+    fi
+    case "$name" in
+      temutalk)  clone_or_update temutalk  "$TEMUTALK_REPO" temutalk ;;
+      git-forge) clone_or_update git-forge "$FORGE_REPO"    git-forge ;;
+      tag)       clone_or_update tag       "$TAG_REPO"      tag ;;
+    esac
+    local after; after=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
+    # No prior HEAD (fresh clone) counts as changed too -- there's new code
+    # on disk that's never been running yet.
+    if [ -z "$before" ] || [ "$before" != "$after" ]; then
+      case "$name" in
+        temutalk)  changed_temutalk=1 ;;
+        git-forge) changed_forge=1 ;;
+        tag)       changed_tag=1 ;;
+      esac
+    fi
+  done
+
+  if [ "$changed_temutalk" -eq 0 ] && [ "$changed_forge" -eq 0 ] && [ "$changed_tag" -eq 0 ]; then
+    ok "No updates found — everything already up to date."
+    _updates_available=0
+    _last_update_check=$(date +%s)
+    return
+  fi
+
+  echo "  Updates found:"
+  [ "$changed_temutalk" -eq 1 ] && echo "    - temutalk"
+  [ "$changed_forge" -eq 1 ]    && echo "    - git-forge"
+  [ "$changed_tag" -eq 1 ]      && echo "    - tag"
+
   local npm_bin; npm_bin=$(find_npm)
   if [ -n "$npm_bin" ]; then
-    run_capturing "git-forge-npm-install" bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
-    [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
+    [ "$changed_forge" -eq 1 ] && run_capturing "git-forge-npm-install" \
+      bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
+    [ "$changed_tag" -eq 1 ] && [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" \
+      bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
   fi
-  read -rp "  Restart running services to apply? [Y/n] " yn
+
+  read -rp "  Restart affected services to apply? [Y/n] " yn
   if [[ ! "$yn" =~ ^[Nn]$ ]]; then
-    proc_running forge     && { stop_proc forge;     start_forge; }
-    proc_running tag-relay && { stop_proc tag-relay; start_tag_relay; }
-    proc_running temutalk  && { stop_proc temutalk;  start_temutalk; }
-    ok "Restarted."
+    [ "$changed_forge" -eq 1 ]    && proc_running forge     && { stop_proc forge;     start_forge; }
+    [ "$changed_tag" -eq 1 ]      && proc_running tag-relay && { stop_proc tag-relay; start_tag_relay; }
+    [ "$changed_temutalk" -eq 1 ] && proc_running temutalk  && { stop_proc temutalk;  start_temutalk; }
+    ok "Restarted affected services."
   fi
   _updates_available=0
   _last_update_check=$(date +%s)
@@ -2754,6 +2816,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
 fi
 if [ "${1:-}" = "status" ]; then status_json; exit 0; fi
 if [ "${1:-}" = "errors" ]; then do_view_errors; exit 0; fi
+if [ "${1:-}" = "check-updates" ]; then do_check_updates; exit 0; fi
 if [ "${1:-}" = "enroll" ]; then setup_temutalk_usb_key; exit 0; fi
 
 # ─── First-run setup, then TUI ───────────────────────────────────────────────
