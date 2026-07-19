@@ -418,8 +418,29 @@ find_cloudflared() {
 
 # ─── PID helpers ──────────────────────────────────────────────────────────────
 pid_file()     { echo "$DIR/.run/$1.pid"; }
-proc_running() { local f; f=$(pid_file "$1"); [ -f "$f" ] && kill -0 "$(cat "$f" 2>/dev/null)" 2>/dev/null; }
-proc_pid()     { local f; f=$(pid_file "$1"); [ -f "$f" ] && cat "$f"; }
+# Pidfiles are written as "<os>:<pid>", not a bare PID -- this whole tree
+# runs off a portable drive that moves between machines, and PIDs from one
+# OS mean nothing on another (confirmed live: a Windows-session PID left in
+# a pidfile happened to match a genuinely running, completely unrelated
+# Linux process on terraserver -- wireplumber, an audio daemon -- so
+# `kill -0` succeeded by pure coincidence and every start_*() function
+# believed the real service was "already running" and skipped starting it).
+# A pidfile whose OS tag doesn't match detect_os right now is therefore
+# always treated as stale, regardless of whether kill -0 would succeed.
+proc_running() {
+  local f; f=$(pid_file "$1")
+  [ -f "$f" ] || return 1
+  local raw; raw=$(cat "$f" 2>/dev/null)
+  local tag="${raw%%:*}" pid="${raw##*:}"
+  [ "$tag" = "$(detect_os)" ] || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+proc_pid() {
+  local f; f=$(pid_file "$1")
+  [ -f "$f" ] || return
+  local raw; raw=$(cat "$f" 2>/dev/null)
+  echo "${raw##*:}"
+}
 stop_proc() {
   local name="$1"
   if proc_running "$name"; then
@@ -2077,7 +2098,7 @@ start_forge() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/git-forge" && BASE_PATH=/forge PORT="$FORGE_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/forge.log" 2>&1 & echo $! > "$(pid_file forge)" )
+    nohup "$node_bin" server.js > "$DIR/logs/forge.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file forge)" )
   sleep 1
   if proc_running forge; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
   else snapshot_log_on_failure "forge-start" "$DIR/logs/forge.log"; fi
@@ -2089,7 +2110,7 @@ start_tag_relay() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/tag/relay-server" && BASE_PATH=/tag PORT="$TAG_RELAY_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/tag-relay.log" 2>&1 & echo $! > "$(pid_file tag-relay)" )
+    nohup "$node_bin" server.js > "$DIR/logs/tag-relay.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
   sleep 1
   if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
   else snapshot_log_on_failure "tag-relay-start" "$DIR/logs/tag-relay.log"; fi
@@ -2106,7 +2127,7 @@ start_remote_admin() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/remote-admin" && \
-    nohup "$node_bin" remote-admin.js > "$DIR/logs/remote-admin.log" 2>&1 & echo $! > "$(pid_file remote-admin)" )
+    nohup "$node_bin" remote-admin.js > "$DIR/logs/remote-admin.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
   sleep 1
   if proc_running remote-admin; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
   else snapshot_log_on_failure "remote-admin-start" "$DIR/logs/remote-admin.log"; fi
@@ -2225,15 +2246,15 @@ ensure_portable_node() {
   # heals a wrapper that baked in a stale absolute path from a previous
   # machine/mount point, like the one above describes).
   #
-  # -s (non-empty), not just -x/-f: a truncated-to-0-bytes node.exe or
-  # npm-cli.js (confirmed live -- the same USB-write-corruption failure mode
-  # documented elsewhere in this file) would otherwise pass an existence
-  # check and get silently treated as "already present", so every service
-  # falls back through find_node() to whatever system Node happens to be on
-  # PATH -- which, unlike the pinned portable v20, can be a version (v24
-  # confirmed live) strict enough about package.json validation to hard-crash
-  # on node_modules that were perfectly fine under the portable runtime.
-  if [ -s "$node_bin_path" ] && [ -s "$npm_cli_path" ]; then
+  # -s (non-empty) catches a truncated-to-0-bytes file, but not a file
+  # that's plausibly-sized yet still doesn't actually work -- confirmed
+  # live on terraserver: a stray node binary left over from a much earlier,
+  # unrelated setup (dated months before anything in this session) was a
+  # full, correctly-sized, correctly-architected ELF executable that
+  # segfaulted on every single invocation. Only actually running it proves
+  # it works. This is the same reasoning as ensure_portable_cloudflared's
+  # --version check below.
+  if [ -s "$node_bin_path" ] && [ -s "$npm_cli_path" ] && "$node_bin_path" --version >/dev/null 2>&1; then
     :
   else
     info "Downloading portable Node.js ($platform_tag)..."
@@ -2289,7 +2310,23 @@ NPM_WRAPPER
 ensure_portable_cloudflared() {
   local os cf_bin_name; os=$(detect_os)
   cf_bin_name="cloudflared"; [ "$os" = "windows" ] && cf_bin_name="cloudflared.exe"
-  if [ -x "$DIR/.bin/$cf_bin_name" ]; then ok "cloudflared already present."; return; fi
+  # -s (non-empty), not just -x: confirmed live on terraserver -- a 0-byte
+  # cloudflared binary still had its executable bit set (exFAT can retain
+  # permission bits independently of a truncated write), so this passed an
+  # -x-only check and was never re-downloaded, then segfaulted on every
+  # exec attempt. Same class of bug already fixed in find_node/find_npm/
+  # find_cloudflared/ensure_portable_node -- this was the one remaining
+  # call site still using the weaker check.
+  #
+  # The --version run is a second, independent check: also confirmed live,
+  # a fully-sized, correctly-architected binary can still be broken (a
+  # stray leftover from a much earlier, unrelated setup segfaulted on
+  # every invocation despite passing every size/permission check). Only
+  # actually running it proves it works.
+  if [ -s "$DIR/.bin/$cf_bin_name" ] && "$DIR/.bin/$cf_bin_name" --version >/dev/null 2>&1; then
+    ok "cloudflared already present."
+    return
+  fi
 
   local arch cf_arch
   arch=$(uname -m)
@@ -2501,7 +2538,7 @@ start_dev_panel() {
   ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
     TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
-    nohup "$node_bin" dev-panel.js > "$DIR/logs/dev-panel.log" 2>&1 & echo $! > "$(pid_file dev-panel)" )
+    nohup "$node_bin" dev-panel.js > "$DIR/logs/dev-panel.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
   sleep 1
   if proc_running dev-panel; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
   else snapshot_log_on_failure "dev-panel-start" "$DIR/logs/dev-panel.log"; fi
@@ -2513,7 +2550,7 @@ start_temutalk() {
   local node_bin; node_bin=$(find_temutalk_node)
   if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
   ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
-    nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo $! > "$(pid_file temutalk)" )
+    nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file temutalk)" )
   sleep 2
   if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
   else snapshot_log_on_failure "temutalk-start" "$DIR/logs/temutalk.log"; fi
@@ -2526,7 +2563,7 @@ start_portal() {
   ( cd "$DIR/portal" && PORT="$PORTAL_PORT" \
     TEMUTALK_TARGET="https://127.0.0.1:$TEMUTALK_PORT" FORGE_TARGET="http://127.0.0.1:$FORGE_PORT" \
     TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/portal.log" 2>&1 & echo $! > "$(pid_file portal)" )
+    nohup "$node_bin" server.js > "$DIR/logs/portal.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
   sleep 1
   if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
   else snapshot_log_on_failure "portal-start" "$DIR/logs/portal.log"; fi
@@ -2594,7 +2631,7 @@ EOF
     args+=(--config "$(to_native_path "$_TUNNEL_CONFIG_FILE")" tunnel run)
   fi
   nohup "$cf_bin" "${args[@]}" > "$DIR/logs/tunnel.log" 2>&1 &
-  echo $! > "$(pid_file tunnel)"
+  echo "$(detect_os):$!" > "$(pid_file tunnel)"
   sleep 2
   if proc_running tunnel; then ok "Tunnel started (PID $(proc_pid tunnel)) → https://${CF_DOMAIN}"
   else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
@@ -2603,19 +2640,20 @@ EOF
 do_start() {
   clear_error_logs
   # Only call ensure_portable_node/ensure_portable_cloudflared at all when
-  # the runtime isn't already known-good -- once node/npm/cloudflared are
-  # confirmed present (the same -s non-empty check find_node/find_npm/
-  # find_cloudflared use), skip them entirely instead of re-running their
-  # presence check on every single start. Self-healing still applies: if a
-  # wrapper was truncated or is genuinely missing since the last start,
-  # this still catches it and repairs it before anything launches, so
-  # services never silently fall back to whatever (potentially
-  # incompatible) system Node happens to be on PATH.
-  if [ ! -s "$DIR/.bin/node" ] || [ ! -s "$DIR/.bin/npm" ]; then
+  # the runtime isn't already known-good -- once confirmed present AND
+  # actually runnable (not just non-empty -- confirmed live on terraserver
+  # that a fully-sized, correctly-architected binary can still segfault on
+  # every invocation), skip them entirely instead of re-running their
+  # checks on every single start. Self-healing still applies: if the
+  # runtime was truncated, is genuinely missing, or doesn't actually run
+  # since the last start, this still catches it and repairs it before
+  # anything launches, so services never silently fall back to whatever
+  # (potentially incompatible) system Node happens to be on PATH.
+  if ! { [ -s "$DIR/.bin/node" ] && [ -s "$DIR/.bin/npm" ] && "$DIR/.bin/node" --version >/dev/null 2>&1; }; then
     ensure_portable_node
   fi
   local cf_bin_name="cloudflared"; [ "$(detect_os)" = "windows" ] && cf_bin_name="cloudflared.exe"
-  if [ ! -s "$DIR/.bin/$cf_bin_name" ]; then
+  if ! { [ -s "$DIR/.bin/$cf_bin_name" ] && "$DIR/.bin/$cf_bin_name" --version >/dev/null 2>&1; }; then
     ensure_portable_cloudflared
   fi
   start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
