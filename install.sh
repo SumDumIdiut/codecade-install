@@ -517,6 +517,7 @@ const PORT = parseInt(process.env.PORT || '8080', 10);
 const TEMUTALK_TARGET = process.env.TEMUTALK_TARGET || 'https://127.0.0.1:3001';
 const FORGE_TARGET = process.env.FORGE_TARGET || 'http://127.0.0.1:3000';
 const TAG_RELAY_TARGET = process.env.TAG_RELAY_TARGET || 'http://127.0.0.1:3002';
+const DEV_PANEL_TARGET = process.env.DEV_PANEL_TARGET || 'https://127.0.0.1:9091';
 
 const app = express();
 
@@ -548,10 +549,25 @@ const tagRelayProxy = createProxyMiddleware({
   changeOrigin: true,
   logLevel: 'warn',
 });
+// dev-panel.js's TLS cert is self-signed (same as temutalk's), and it's
+// BASE_PATH-aware specifically for this mount: it detects the /panel
+// prefix on each incoming request and rewrites every absolute link/
+// fetch/WebSocket URL/cookie Path it emits to match, so it keeps working
+// identically whether reached here or directly on its own port -- see
+// detectPrefix() in dev-panel.js. ws:true because the panel's terminal
+// tab is a real WebSocket (xterm.js), same as temutalk's own tab.
+const devPanelProxy = createProxyMiddleware({
+  target: DEV_PANEL_TARGET,
+  changeOrigin: true,
+  secure: false,
+  ws: true,
+  logLevel: 'warn',
+});
 
 app.use('/temutalk', temutalkProxy);
 app.use('/forge', forgeProxy);
 app.use('/tag', tagRelayProxy);
+app.use('/panel', devPanelProxy);
 app.use(express.static(path.join(__dirname, 'public')));
 
 const server = http.createServer(app);
@@ -582,6 +598,7 @@ function proxyTagWebSocket(req, socket, head) {
 server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith('/temutalk')) return temutalkProxy.upgrade(req, socket, head);
   if (req.url.startsWith('/tag')) return proxyTagWebSocket(req, socket, head);
+  if (req.url.startsWith('/panel')) return devPanelProxy.upgrade(req, socket, head);
   socket.destroy();
 });
 
@@ -589,7 +606,8 @@ server.listen(PORT, () => {
   console.log(`\n  Portal running at http://localhost:${PORT}`);
   console.log(`    /temutalk -> ${TEMUTALK_TARGET}`);
   console.log(`    /forge    -> ${FORGE_TARGET}`);
-  console.log(`    /tag      -> ${TAG_RELAY_TARGET}\n`);
+  console.log(`    /tag      -> ${TAG_RELAY_TARGET}`);
+  console.log(`    /panel    -> ${DEV_PANEL_TARGET}\n`);
 });
 PORTAL_SERVER_JS
 
@@ -687,6 +705,20 @@ const KEY_HASH_FILE        = process.env.TEMUTALK_KEY_HASH_FILE || path.join(TEM
 const TEMUTALK_SERVER_PORT = parseInt(process.env.TEMUTALK_SERVER_PORT || '3001', 10);
 const RUN_DIR = path.join(__dirname, '.run');
 
+// Reachable two ways at once with this same running process: directly on
+// its own port (:9091, unprefixed -- unchanged, original behavior) and
+// proxied through the portal at codecade.co.za/panel (see portal/
+// server.js's devPanelProxy, which preserves this prefix rather than
+// stripping it, same as its /temutalk and /forge mounts). Detected fresh
+// per-request from the incoming path rather than baked in at startup, so
+// one process serves both correctly -- every response (route matching,
+// emitted HTML's absolute fetch/WebSocket URLs, cookie Path) is built
+// around whichever prefix that request actually arrived with.
+const PROXY_PREFIX = '/panel';
+function detectPrefix(pathname) {
+  return (pathname === PROXY_PREFIX || pathname.startsWith(PROXY_PREFIX + '/')) ? PROXY_PREFIX : '';
+}
+
 let pty = null;
 try { pty = require('node-pty'); } catch {}
 
@@ -731,10 +763,10 @@ function parseCookies(req) {
   return out;
 }
 function isAuthed(req) { return verifySession(parseCookies(req).panel_session); }
-function refreshSession(req, res) {
+function refreshSession(req, res, prefix) {
   if (!isAuthed(req)) return;
   const payload = `s:${Date.now() + SESSION_TTL_MS}`;
-  res.setHeader('Set-Cookie', `panel_session=${signSession(payload)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+  res.setHeader('Set-Cookie', `panel_session=${signSession(payload)}; Path=${prefix || '/'}; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
 }
 
 const attempts = new Map();
@@ -807,7 +839,7 @@ function securityHeaders(res) {
 }
 
 // ─── Login page ───────────────────────────────────────────────────────────────
-function loginPage() {
+function loginPage(prefix = '') {
   return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>codecade Dev Panel</title>
@@ -853,14 +885,14 @@ drop.ondragover=e=>{e.preventDefault();drop.classList.add('over');};
 drop.ondragleave=()=>drop.classList.remove('over');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');if(e.dataTransfer.files[0])readFile(e.dataTransfer.files[0]);};
 async function doLogin(){err.textContent='';btn.disabled=true;
-  try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyContent:kc})});
+  try{const r=await fetch('${prefix}/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keyContent:kc})});
   if(r.ok){location.reload();return;}const j=await r.json().catch(()=>({}));err.textContent=j.error||'Login failed';}
   catch(e2){err.textContent='Request failed: '+e2.message;}btn.disabled=false;}
 </script></body></html>`;
 }
 
 // ─── Main panel page (Terminal + TemuTalk tabs) ──────────────────────────────
-function page() {
+function page(prefix = '') {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1196,6 +1228,13 @@ details summary:hover{color:var(--tx)}
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
 <script>
 const MAIN_PORT=${TEMUTALK_SERVER_PORT};
+// Interpolated once here from the server-detected prefix (see
+// detectPrefix() in dev-panel.js) rather than re-templated at every call
+// site below -- every same-origin fetch()/WebSocket URL in this page is
+// built as PREFIX+'/whatever' so it resolves correctly whether this page
+// was loaded directly (:9091, PREFIX='') or through the portal
+// (codecade.co.za/panel, PREFIX='/panel').
+const PREFIX='${prefix}';
 
 // ── Outer tab switching (Terminal | TemuTalk) ─────────────────────────────────
 function switchMainTab(name){
@@ -1204,7 +1243,7 @@ function switchMainTab(name){
   var p=document.getElementById('pane-'+name);if(p)p.classList.add('on');
 }
 
-async function logout(){await fetch('/api/logout',{method:'POST'});location.reload();}
+async function logout(){await fetch(PREFIX+'/api/logout',{method:'POST'});location.reload();}
 
 // ── Terminal ──────────────────────────────────────────────────────────────────
 var term=null,fit=null,termWs=null;
@@ -1212,7 +1251,7 @@ function termConnect(){
   if(!term){document.getElementById('term-status').textContent='xterm not loaded';return;}
   if(termWs&&termWs.readyState<2)termWs.close();
   var proto=location.protocol==='https:'?'wss:':'ws:';
-  termWs=new WebSocket(proto+'//'+location.host+'/terminal');
+  termWs=new WebSocket(proto+'//'+location.host+PREFIX+'/terminal');
   termWs.onopen=function(){
     document.getElementById('term-dot').classList.add('on');
     document.getElementById('term-status').textContent='Connected — running install.sh';
@@ -1404,7 +1443,7 @@ async function clearRoom(){
   var btn=document.getElementById('clear-btn');
   if(btn)btn.disabled=true;
   try{
-    var r=await fetch('/api/clear-room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({room:curRoom})});
+    var r=await fetch(PREFIX+'/api/clear-room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({room:curRoom})});
     var d=await r.json();
     if(!d.ok)alert(d.error||'Failed to clear');
   }catch(e){alert('Error: '+e.message);}
@@ -1425,7 +1464,7 @@ async function panelSend(){
   if(!room||!text)return;
   var btn=document.getElementById('m-send');if(btn)btn.disabled=true;
   try{
-    var endpoint=activeSender==='testuser'?'/api/test-msg':'/api/panel-broadcast';
+    var endpoint=PREFIX+(activeSender==='testuser'?'/api/test-msg':'/api/panel-broadcast');
     var r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({room:room,text:text})});
     var d=await r.json();
     if(d.ok){if(inp)inp.value='';inp?.focus();}
@@ -1511,7 +1550,7 @@ function selectDevice(id){
 // ── Admin data polling ────────────────────────────────────────────────────────
 async function refreshAdmin(){
   try{
-    var r=await fetch('/api/admin');
+    var r=await fetch(PREFIX+'/api/admin');
     if(r.status===401){location.reload();return;}
     var j=await r.json();
     if(!j.overview)return;
@@ -1537,7 +1576,7 @@ async function refreshAdmin(){
 // ── Accounts ──────────────────────────────────────────────────────────────────
 async function loadAccounts(){
   try{
-    var r=await fetch('/api/chat-accounts');
+    var r=await fetch(PREFIX+'/api/chat-accounts');
     if(!r.ok){document.getElementById('accs-list').innerHTML='<div style="color:var(--sec);font-size:13px">Could not load</div>';return;}
     var d=await r.json();
     chatAccounts=d.accounts||[];
@@ -1578,7 +1617,7 @@ function renderGroups(groups){
 async function deleteGroup(id){
   if(!confirm('Delete this group and all its messages?'))return;
   try{
-    var r=await fetch('/api/admin/chat-group/'+encodeURIComponent(id),{method:'DELETE'});
+    var r=await fetch(PREFIX+'/api/admin/chat-group/'+encodeURIComponent(id),{method:'DELETE'});
     var d=await r.json();
     if(d.ok)loadAccounts();else alert(d.error||'Delete failed');
   }catch(e){alert('Error: '+e.message);}
@@ -1587,7 +1626,7 @@ async function deleteGroup(id){
 // ── Test user ─────────────────────────────────────────────────────────────────
 async function loadTestReqs(){
   try{
-    var r=await fetch('/api/test-friend-reqs');
+    var r=await fetch(PREFIX+'/api/test-friend-reqs');
     var d=await r.json();
     var el=document.getElementById('tu-reqs');if(!el)return;
     var reqs=d.reqs||[];
@@ -1605,7 +1644,7 @@ async function loadTestReqs(){
 
 async function testFriendAll(){
   try{
-    var r=await fetch('/api/test-friend-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    var r=await fetch(PREFIX+'/api/test-friend-all',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     var d=await r.json();
     if(d.ok)alert('Friended '+d.count+' user(s) with Test User.');
     else alert(d.error||'Failed');
@@ -1614,7 +1653,7 @@ async function testFriendAll(){
 
 async function testAcceptReq(fromId){
   try{
-    var r=await fetch('/api/test-accept-req',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fromId:fromId})});
+    var r=await fetch(PREFIX+'/api/test-accept-req',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fromId:fromId})});
     var d=await r.json();
     if(d.ok)loadTestReqs();else alert(d.error||'Failed');
   }catch(e){alert('Error: '+e.message);}
@@ -1642,7 +1681,7 @@ async function pmSave(){
   btn.disabled=true;msg.style.color='';msg.textContent='Saving…';
   var body={key:pmKey,name:document.getElementById('pm-name').value.trim(),avatarUrl:document.getElementById('pm-avatar-url').value.trim()||null};
   try{
-    var r=await fetch('/api/chat-account',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var r=await fetch(PREFIX+'/api/chat-account',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(d.ok){
       msg.style.color='#3fb950';msg.textContent='Saved';
@@ -1658,7 +1697,7 @@ async function pmSave(){
 async function doRestart(){
   var btn=document.getElementById('restart-btn');
   btn.textContent='Restarting…';btn.disabled=true;
-  try{var r=await fetch('/api/restart-server',{method:'POST'});var d=await r.json();btn.textContent=d.ok?'Done ✓':'Failed';}
+  try{var r=await fetch(PREFIX+'/api/restart-server',{method:'POST'});var d=await r.json();btn.textContent=d.ok?'Done ✓':'Failed';}
   catch(e){btn.textContent='Error';}
   setTimeout(function(){btn.innerHTML='&#8635; Restart';btn.disabled=false;},3000);
 }
@@ -1667,10 +1706,20 @@ async function doRestart(){
 async function spyConnect(){
   if(spyWs&&spyWs.readyState<2)return;
   try{
-    var r=await fetch('/api/ghost-token');if(!r.ok)return;
+    var r=await fetch(PREFIX+'/api/ghost-token');if(!r.ok)return;
     var j=await r.json();if(!j.token)return;
     var proto=location.protocol==='https:'?'wss:':'ws:';
     var ghostId='ghost-'+Math.random().toString(36).slice(2);
+    // Deliberately NOT run through PREFIX/the portal -- this connects
+    // straight to temutalk's own port (MAIN_PORT), which is only reachable
+    // when this page itself is loaded directly off the host (:9091, same
+    // LAN/machine). Loaded through codecade.co.za/panel, location.hostname
+    // is the public domain and this raw port was never tunneled (only the
+    // portal's own port is), so the ghost-spy live chat view specifically
+    // won't connect over that path -- everything else on this page (login,
+    // terminal, the rest of the TemuTalk admin tab's REST calls) still
+    // works fine either way, since those all go through PREFIX-aware
+    // fetch()/'/terminal' above instead of a raw host:port.
     var wsHost=location.hostname+':'+MAIN_PORT;
     spyWs=new WebSocket(proto+'//'+wsHost);
     spyWs.onopen=function(){
@@ -1773,7 +1822,10 @@ function handleTerminalWs(ws) {
 }
 
 function handleUpgrade(req, socket, head) {
-  if (new URL(req.url, 'http://x').pathname === '/terminal' && isAuthed(req)) {
+  const pathname = new URL(req.url, 'http://x').pathname;
+  const prefix = detectPrefix(pathname);
+  const routePath = prefix ? (pathname.slice(prefix.length) || '/') : pathname;
+  if (routePath === '/terminal' && isAuthed(req)) {
     wss.handleUpgrade(req, socket, head, ws => handleTerminalWs(ws));
   } else {
     socket.destroy();
@@ -1784,6 +1836,12 @@ function handleUpgrade(req, socket, head) {
 async function handleRequest(req, res) {
   securityHeaders(res);
   const url = new URL(req.url, 'https://localhost');
+  const prefix = detectPrefix(url.pathname);
+  // Route matching below stays written exactly as it always was (bare
+  // paths like '/api/login') by stripping the prefix here, once, up
+  // front -- prefix only needs re-adding when generating a response
+  // (page()/loginPage()'s emitted links, cookie Path).
+  if (prefix) url.pathname = url.pathname.slice(prefix.length) || '/';
   const ip  = req.socket.remoteAddress || 'unknown';
 
   if (req.method === 'POST' && url.pathname === '/api/login') {
@@ -1800,7 +1858,7 @@ async function handleRequest(req, res) {
       if (verifyKeyContent(keyContent)) {
         recordSuccess(ip);
         const payload = `s:${Date.now() + SESSION_TTL_MS}`;
-        res.setHeader('Set-Cookie', `panel_session=${signSession(payload)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+        res.setHeader('Set-Cookie', `panel_session=${signSession(payload)}; Path=${prefix || '/'}; HttpOnly; Secure; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
         sendJson(res, 200, { ok: true });
       } else {
         recordFailure(ip);
@@ -1811,25 +1869,25 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === 'POST' && url.pathname === '/api/logout') {
-    res.setHeader('Set-Cookie', `panel_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
+    res.setHeader('Set-Cookie', `panel_session=; Path=${prefix || '/'}; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
     sendJson(res, 200, { ok: true });
     return;
   }
 
   if (url.pathname === '/') {
     if (isAuthed(req)) {
-      refreshSession(req, res);
+      refreshSession(req, res, prefix);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(page());
+      res.end(page(prefix));
     } else {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(loginPage());
+      res.end(loginPage(prefix));
     }
     return;
   }
 
   if (!isAuthed(req)) { sendJson(res, 401, { error: 'Not authenticated' }); return; }
-  refreshSession(req, res);
+  refreshSession(req, res, prefix);
 
   // ── TemuTalk tab: proxied to temutalk's own server ──────────────────────────
   if (req.method === 'GET' && url.pathname === '/api/admin') {
@@ -2588,7 +2646,7 @@ start_portal() {
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/portal" && PORT="$PORTAL_PORT" \
     TEMUTALK_TARGET="https://127.0.0.1:$TEMUTALK_PORT" FORGE_TARGET="http://127.0.0.1:$FORGE_PORT" \
-    TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" \
+    TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" DEV_PANEL_TARGET="https://127.0.0.1:$DEV_PANEL_PORT" \
     nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
   sleep 1
   if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
