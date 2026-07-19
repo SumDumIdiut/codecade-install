@@ -297,15 +297,19 @@ snapshot_log_on_failure() {
     >> "$DIR/error.log" 2>/dev/null
 }
 
-# Wipes error.log so a fresh start attempt is never confused with stale
-# failures from an earlier run (a real prior symptom: a since-fixed
-# tunnel-credentials warning kept showing up in the DIAGNOSTICS view long
-# after the actual fix landed, because nothing ever cleared it). Called at
-# the top of do_start() -- if this attempt has real failures, they'll be
-# recorded fresh; if it succeeds clean, there's nothing stale left over to
-# confuse the next person looking at DIAGNOSTICS.
-clear_error_logs() {
+# Wipes error.log and service.log so a fresh run is never confused with
+# stale output from an earlier one (a real prior symptom: a since-fixed
+# tunnel-credentials warning, and later a since-fixed EADDRINUSE race, both
+# kept showing up in DIAGNOSTICS long after the actual fix landed, because
+# nothing reliably cleared them between runs). Called wherever the program
+# is actually being *run* -- the default interactive launch, `setup`, and
+# do_start() -- but deliberately not from read-only/narrowly-scoped paths
+# (`status`, `errors`, `check-updates`, a single `start <service>`), where
+# wiping everyone else's recent output would be a surprising side effect of
+# what's meant to be a targeted or read-only action.
+clear_logs() {
   : > "$DIR/error.log" 2>/dev/null
+  : > "$DIR/service.log" 2>/dev/null
 }
 
 update_checkout_hard() {
@@ -2660,7 +2664,7 @@ EOF
 }
 
 do_start() {
-  clear_error_logs
+  clear_logs
   # Only call ensure_portable_node/ensure_portable_cloudflared at all when
   # the runtime isn't already known-good -- once confirmed present AND
   # actually runnable (not just non-empty -- confirmed live on terraserver
@@ -2787,7 +2791,7 @@ do_view_errors() {
 }
 
 # ─── Non-interactive CLI dispatch ────────────────────────────────────────────
-if [ "${1:-}" = "setup" ]; then do_setup; exit 0; fi
+if [ "${1:-}" = "setup" ]; then clear_logs; do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
 if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   case "${2:-}" in
@@ -2820,6 +2824,9 @@ if [ "${1:-}" = "check-updates" ]; then do_check_updates; exit 0; fi
 if [ "${1:-}" = "enroll" ]; then setup_temutalk_usb_key; exit 0; fi
 
 # ─── First-run setup, then TUI ───────────────────────────────────────────────
+# Reaching here means the program is actually being *run* (no narrowly-
+# scoped or read-only CLI verb matched above) -- start with clean logs.
+clear_logs
 echo ""
 echo "  ${C_BOLD}codecade.co.za — Portal Installer${C_RESET}"
 echo ""
@@ -2859,13 +2866,17 @@ _tab_selected=0
 _menu_selected=0
 
 # Reads one keypress, with a timeout so the menu loop periodically wakes up
-# on its own (used to drive the quiet background update check below) even
-# if nobody presses anything. Arrow keys arrive as a 3-byte escape sequence
-# (ESC [ A/B/C/D) — a lone ESC (e.g. someone just tapping Escape) times out
-# on the second read instead of hanging, and falls through as an ignored key.
+# on its own (used to drive the quiet background update check below, and to
+# keep the status display live) even if nobody presses anything. 1s, not
+# the original 5s -- the status rows (running/stopped) only actually
+# refresh on each loop iteration, so 5s made the whole dashboard feel
+# noticeably laggy for something showing live service state. Arrow keys
+# arrive as a 3-byte escape sequence (ESC [ A/B/C/D) — a lone ESC (e.g.
+# someone just tapping Escape) times out on the second read instead of
+# hanging, and falls through as an ignored key.
 read_key() {
   local key rest
-  IFS= read -rsn1 -t 5 key
+  IFS= read -rsn1 -t 1 key
   if [ $? -gt 128 ]; then
     printf 'TIMEOUT'
     return
