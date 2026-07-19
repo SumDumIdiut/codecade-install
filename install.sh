@@ -9,16 +9,17 @@
 #   bash install.sh                first run: clone, install, setup, then TUI
 #   bash install.sh start all      non-interactive start (used by the TUI itself)
 #   bash install.sh status         JSON status snapshot
-#   bash install.sh errors         list recorded errors (also in the errors/ folder)
+#   bash install.sh errors         show error.log (single flat file, whole tree)
 #   bash install.sh bundle <dest>  copy install.sh + all repos to <dest> (e.g. a
 #                                   mounted USB drive) so it can be plugged into
 #                                   any machine and run without needing network
 #                                   access to re-clone from GitHub
 #
 # Every failure (failed clone/npm-install/service-start) is recorded verbosely
-# under errors/ — a running errors/errors.log transcript, plus a full-output
-# snapshot file per failure — so nothing is lost even if nobody was watching
-# the terminal when it broke.
+# to a single error.log, and every service's own output goes to a single
+# service.log — one flat file each, not a directory of per-service/per-
+# failure files, so nothing is lost even if nobody was watching the terminal
+# when it broke.
 
 set -uo pipefail
 
@@ -66,13 +67,13 @@ fi
 ok()   { echo "  ${C_GREEN}✓${C_RESET} $1"; }
 info() { echo "  ${C_CYAN}..${C_RESET} $1"; }
 warn() { echo "  ${C_YELLOW}!${C_RESET} $1"; }
-# Every err() call is also appended to errors/errors.log with a timestamp —
-# applies automatically to every existing call site, no need to touch them.
-# For failures worth capturing full command output (not just the one-line
-# message), see run_capturing() below.
+# Every err() call is also appended to error.log (single flat file, whole
+# tree) with a timestamp — applies automatically to every existing call
+# site, no need to touch them. For failures worth capturing full command
+# output (not just the one-line message), see run_capturing() below.
 err()  {
   echo "  ${C_RED}✗${C_RESET} $1"
-  printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >> "$DIR/errors/errors.log" 2>/dev/null
+  printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >> "$DIR/error.log" 2>/dev/null
 }
 
 # ─── Self-update ──────────────────────────────────────────────────────────
@@ -258,12 +259,14 @@ ensure_git() {
 ensure_git
 self_update "$@"
 
-mkdir -p logs .run errors
+mkdir -p .run
+touch "$DIR/error.log" "$DIR/service.log"
 
-# Runs a command with combined stdout+stderr captured. On failure, saves the
-# full output to a timestamped file under errors/ (referenced from the
-# one-line err() message) instead of just letting it scroll past in the
-# terminal — the detail survives even if you weren't watching when it broke.
+# Runs a command with combined stdout+stderr captured. On failure, the full
+# output is appended directly into error.log (single flat file, whole tree)
+# under a timestamped header, instead of a separate per-failure file and
+# instead of just letting it scroll past in the terminal — the detail
+# survives even if you weren't watching when it broke.
 run_capturing() {
   local label="$1"; shift
   local out; out="$(mktemp 2>/dev/null)" || { "$@"; return $?; }
@@ -272,35 +275,34 @@ run_capturing() {
     return 0
   else
     local code=$?
-    local dest="errors/$(date -u +%Y%m%d-%H%M%S)-${label}.log"
-    mv "$out" "$dest" 2>/dev/null || cp "$out" "$dest" 2>/dev/null
-    err "$label failed — full output: $dest"
+    err "$label failed"
+    { printf -- '----- %s (%s) -----\n' "$label" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; cat "$out"; echo; } \
+      >> "$DIR/error.log" 2>/dev/null
+    rm -f "$out"
     return "$code"
   fi
 }
 
-# Snapshots the tail of a running service's log into errors/ at the moment a
-# start failure is detected, so the failure context survives even after the
-# log file keeps growing / gets rotated later.
+# Appends the tail of service.log into error.log at the moment a start
+# failure is detected, under a timestamped header, so the failure context
+# survives even after service.log keeps growing.
 snapshot_log_on_failure() {
   local label="$1" logfile="$2"
+  err "$label failed — check $logfile"
   [ -f "$logfile" ] || return
-  local dest="errors/$(date -u +%Y%m%d-%H%M%S)-${label}.log"
-  tail -n 80 "$logfile" > "$dest" 2>/dev/null
-  err "$label failed — check $logfile (snapshot: $dest)"
+  { printf -- '----- %s (%s) -----\n' "$label" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"; tail -n 80 "$logfile"; echo; } \
+    >> "$DIR/error.log" 2>/dev/null
 }
 
-# Wipes every recorded error (errors.log + per-failure snapshot files) so a
-# fresh start attempt is never confused with stale failures from an earlier
-# run (a real prior symptom: a since-fixed tunnel-credentials warning kept
-# showing up in the DIAGNOSTICS view long after the actual fix landed,
-# because nothing ever cleared the old snapshot). Called at the top of
-# do_start() -- if this attempt has real failures, they'll be recorded
-# fresh; if it succeeds clean, there's nothing stale left over to confuse
-# the next person looking at DIAGNOSTICS.
+# Wipes error.log so a fresh start attempt is never confused with stale
+# failures from an earlier run (a real prior symptom: a since-fixed
+# tunnel-credentials warning kept showing up in the DIAGNOSTICS view long
+# after the actual fix landed, because nothing ever cleared it). Called at
+# the top of do_start() -- if this attempt has real failures, they'll be
+# recorded fresh; if it succeeds clean, there's nothing stale left over to
+# confuse the next person looking at DIAGNOSTICS.
 clear_error_logs() {
-  rm -f errors/*.log 2>/dev/null
-  : > errors/errors.log 2>/dev/null
+  : > "$DIR/error.log" 2>/dev/null
 }
 
 update_checkout_hard() {
@@ -347,7 +349,7 @@ clone_or_update() {
     # Discarding local changes on every update is the correct, idempotent
     # behavior here, not a risk.
     run_capturing "pull-$name" update_checkout_hard "$dir" \
-      || warn "$name: git update failed — continuing with existing checkout (see errors/ for details)"
+      || warn "$name: git update failed — continuing with existing checkout (see error.log for details)"
   else
     if [ -d "$dir/.git" ]; then
       warn "$name: existing checkout looks corrupted (no valid HEAD) — removing and re-cloning."
@@ -1997,7 +1999,7 @@ do_setup() {
 
   local npm_bin; npm_bin=$(find_npm)
   if [ -z "$npm_bin" ]; then
-    err "npm not found — portable Node.js download must have failed (see errors/ above)."
+    err "npm not found — portable Node.js download must have failed (see error.log above)."
     exit 1
   fi
 
@@ -2098,10 +2100,10 @@ start_forge() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/git-forge" && BASE_PATH=/forge PORT="$FORGE_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/forge.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file forge)" )
+    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file forge)" )
   sleep 1
   if proc_running forge; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
-  else snapshot_log_on_failure "forge-start" "$DIR/logs/forge.log"; fi
+  else snapshot_log_on_failure "forge-start" "$DIR/service.log"; fi
 }
 
 start_tag_relay() {
@@ -2110,10 +2112,10 @@ start_tag_relay() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/tag/relay-server" && BASE_PATH=/tag PORT="$TAG_RELAY_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/tag-relay.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
+    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
   sleep 1
   if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
-  else snapshot_log_on_failure "tag-relay-start" "$DIR/logs/tag-relay.log"; fi
+  else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
 }
 
 # Token-authenticated exec/file-transfer service -- an SSH replacement for
@@ -2127,10 +2129,10 @@ start_remote_admin() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/remote-admin" && \
-    nohup "$node_bin" remote-admin.js > "$DIR/logs/remote-admin.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
+    nohup "$node_bin" remote-admin.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
   sleep 1
   if proc_running remote-admin; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
-  else snapshot_log_on_failure "remote-admin-start" "$DIR/logs/remote-admin.log"; fi
+  else snapshot_log_on_failure "remote-admin-start" "$DIR/service.log"; fi
 }
 
 # ─── TemuTalk's own setup steps, merged in from what used to be a separate
@@ -2367,7 +2369,7 @@ ensure_temutalk_npm_deps() {
   fi
   local npm_bin; npm_bin=$(find_npm)
   if [ -z "$npm_bin" ]; then
-    warn "npm not found — portable Node.js download must have failed (see errors/ above). Re-run setup once that's resolved."
+    warn "npm not found — portable Node.js download must have failed (see error.log above). Re-run setup once that's resolved."
     return
   fi
   info "Installing temutalk npm dependencies..."
@@ -2538,10 +2540,10 @@ start_dev_panel() {
   ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
     TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
-    nohup "$node_bin" dev-panel.js > "$DIR/logs/dev-panel.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
+    nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
   sleep 1
   if proc_running dev-panel; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
-  else snapshot_log_on_failure "dev-panel-start" "$DIR/logs/dev-panel.log"; fi
+  else snapshot_log_on_failure "dev-panel-start" "$DIR/service.log"; fi
 }
 
 start_temutalk() {
@@ -2550,10 +2552,10 @@ start_temutalk() {
   local node_bin; node_bin=$(find_temutalk_node)
   if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
   ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
-    nohup "$node_bin" launcher.js > "$DIR/logs/temutalk.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file temutalk)" )
+    nohup "$node_bin" launcher.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file temutalk)" )
   sleep 2
   if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
-  else snapshot_log_on_failure "temutalk-start" "$DIR/logs/temutalk.log"; fi
+  else snapshot_log_on_failure "temutalk-start" "$DIR/service.log"; fi
 }
 
 start_portal() {
@@ -2563,10 +2565,10 @@ start_portal() {
   ( cd "$DIR/portal" && PORT="$PORTAL_PORT" \
     TEMUTALK_TARGET="https://127.0.0.1:$TEMUTALK_PORT" FORGE_TARGET="http://127.0.0.1:$FORGE_PORT" \
     TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" \
-    nohup "$node_bin" server.js > "$DIR/logs/portal.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
+    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
   sleep 1
   if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
-  else snapshot_log_on_failure "portal-start" "$DIR/logs/portal.log"; fi
+  else snapshot_log_on_failure "portal-start" "$DIR/service.log"; fi
 }
 
 # Reuses temutalk's existing tunnel credentials in temutalk/.cloudflared/, but
@@ -2630,11 +2632,11 @@ EOF
     [ -f "$cert_file" ] && args+=(--origincert "$(to_native_path "$cert_file")")
     args+=(--config "$(to_native_path "$_TUNNEL_CONFIG_FILE")" tunnel run)
   fi
-  nohup "$cf_bin" "${args[@]}" > "$DIR/logs/tunnel.log" 2>&1 &
+  nohup "$cf_bin" "${args[@]}" >> "$DIR/service.log" 2>&1 &
   echo "$(detect_os):$!" > "$(pid_file tunnel)"
   sleep 2
   if proc_running tunnel; then ok "Tunnel started (PID $(proc_pid tunnel)) → https://${CF_DOMAIN}"
-  else snapshot_log_on_failure "tunnel-start" "$DIR/logs/tunnel.log"; fi
+  else snapshot_log_on_failure "tunnel-start" "$DIR/service.log"; fi
 }
 
 do_start() {
@@ -2707,23 +2709,19 @@ do_check_updates() {
 do_view_logs() {
   echo "  ${C_DIM}Ctrl+C to return to the menu.${C_RESET}"
   sleep 1
-  touch logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log logs/remote-admin.log errors/errors.log
-  tail -n 30 -f logs/forge.log logs/temutalk.log logs/portal.log logs/tunnel.log logs/tag-relay.log logs/dev-panel.log logs/remote-admin.log errors/errors.log
+  touch "$DIR/service.log"
+  tail -n 30 -f "$DIR/service.log"
 }
 
 do_view_errors() {
-  local n; n=$(find errors -maxdepth 1 -type f 2>/dev/null | wc -l)
+  local n; n=$(wc -l < "$DIR/error.log" 2>/dev/null || echo 0)
   if [ "$n" -eq 0 ]; then
     warn "No errors recorded yet."
     return
   fi
-  echo "  ${C_BOLD}errors/${C_RESET} ($n file(s))"
-  ls -1t errors | sed 's/^/    /'
+  echo "  ${C_BOLD}error.log${C_RESET} ($n line(s))"
   echo ""
-  if [ -f errors/errors.log ]; then
-    echo "  ${C_DIM}Last 20 entries in errors.log:${C_RESET}"
-    tail -n 20 errors/errors.log | sed 's/^/    /'
-  fi
+  sed 's/^/    /' "$DIR/error.log"
 }
 
 # ─── Non-interactive CLI dispatch ────────────────────────────────────────────
@@ -2876,9 +2874,9 @@ menu() {
     if [ "$_updates_available" -eq 1 ]; then
       echo "  ${C_YELLOW}⚠ Updates available — see DIAGNOSTICS → Check for updates.${C_RESET}"
     fi
-    local _err_count; _err_count=$(find errors -maxdepth 1 -type f 2>/dev/null | wc -l)
+    local _err_count; _err_count=$(wc -l < "$DIR/error.log" 2>/dev/null || echo 0)
     if [ "$_err_count" -gt 0 ]; then
-      echo "  ${C_RED}⚠ $_err_count error file(s) recorded — see DIAGNOSTICS → View errors.${C_RESET}"
+      echo "  ${C_RED}⚠ $_err_count line(s) in error.log — see DIAGNOSTICS → View errors.${C_RESET}"
     fi
     echo ""
 
