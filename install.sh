@@ -577,8 +577,18 @@ const server = http.createServer(app);
 // same kind of pure byte-forwarding, which is what makes this reliable:
 // no WS-frame-aware reparsing anywhere in the path to get wrong.
 function proxyTagWebSocket(req, socket, head) {
+  // The incoming socket is still the one the raw http.Server's connection
+  // handling touched before the 'upgrade' event fired, so it can still be
+  // carrying that server's default keepAliveTimeout (5s) -- fine for plain
+  // request/response traffic, fatal for a long-lived idle WS channel like
+  // the party relay, which gets killed a few seconds after going quiet
+  // with no proper close frame (confirmed live: /relay/party dies this way
+  // while a connection that never sits idle, like a quick /relay/join
+  // rejection, doesn't). setTimeout(0) on both legs disables that.
+  socket.setTimeout(0);
   const target = new URL(TAG_RELAY_TARGET);
   const targetSocket = net.connect(target.port || 80, target.hostname, () => {
+    targetSocket.setTimeout(0);
     let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
