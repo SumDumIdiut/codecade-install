@@ -585,10 +585,22 @@ function proxyTagWebSocket(req, socket, head) {
   // with no proper close frame (confirmed live: /relay/party dies this way
   // while a connection that never sits idle, like a quick /relay/join
   // rejection, doesn't). setTimeout(0) on both legs disables that.
+  //
+  // setNoDelay(true) on both legs disables Nagle's algorithm -- this is a
+  // raw net.connect() pipe, not the ws package (which already calls
+  // setNoDelay() internally for every WS connection it terminates) and not
+  // a Godot WebSocketPeer (which has done the same automatically since
+  // engine 4.3) -- so this hop is the one place in the whole client ->
+  // portal -> relay -> dedicated-server chain that was actually still
+  // batching small packets before this. Real gameplay traffic (input/state
+  // at 60Hz) is exactly the small, frequent, latency-sensitive kind of
+  // traffic Nagle hurts most.
   socket.setTimeout(0);
+  socket.setNoDelay(true);
   const target = new URL(TAG_RELAY_TARGET);
   const targetSocket = net.connect(target.port || 80, target.hostname, () => {
     targetSocket.setTimeout(0);
+    targetSocket.setNoDelay(true);
     let raw = `${req.method} ${req.url} HTTP/1.1\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
