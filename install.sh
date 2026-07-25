@@ -542,11 +542,34 @@ const app = express();
 // http-proxy-middleware preserves the mount prefix (/temutalk, /forge, /tag)
 // in the proxied request by default — each backend is BASE_PATH-aware and
 // expects it.
+// None of the four proxies below set ws:true, even temutalk's and dev-
+// panel's, which DO need real WebSocket support (xterm.js terminals, live
+// chat). All four get their WS upgrades from the SAME explicit,
+// path-filtered server.on('upgrade', ...) dispatcher below instead
+// (temutalkProxy.upgrade(...)/devPanelProxy.upgrade(...) called by hand
+// for their own prefixes, proxyTagWebSocket's raw pipe for /tag).
+// Confirmed live (raw byte capture against production) that /tag WS
+// connections were failing with TWO concatenated "101 Switching
+// Protocols" responses back-to-back, the second immediately followed by
+// http-proxy-middleware's own "Error occurred while trying to proxy: ..."
+// text -- that exact string doesn't exist anywhere in this codebase, so
+// it can only be the library itself attempting (and failing) to proxy an
+// upgrade it was never explicitly routed. The leading suspect: ws:true
+// is documented (http-proxy-middleware GH issues) to make the library
+// internally self-attach its OWN additional upgrade listener straight
+// onto the shared http.Server, independent of and unfiltered by Express's
+// app.use(path, ...) routing -- so a temutalkProxy/devPanelProxy with
+// ws:true set could plausibly grab upgrade requests meant for /tag too,
+// racing the correct explicit dispatcher below. Not independently
+// reproduced in an isolated local harness (same 2x-ws:true shape came
+// back clean), so treat the mechanism as the best available explanation
+// rather than fully proven -- but it's also unneeded regardless: the
+// explicit .upgrade() calls below already do the real WS work for all
+// four mounts, so removing it here is safe either way.
 const temutalkProxy = createProxyMiddleware({
   target: TEMUTALK_TARGET,
   changeOrigin: true,
   secure: false, // temutalk's TLS cert is self-signed
-  ws: true,
   logLevel: 'warn',
 });
 const forgeProxy = createProxyMiddleware({
@@ -554,14 +577,6 @@ const forgeProxy = createProxyMiddleware({
   changeOrigin: true,
   logLevel: 'warn',
 });
-// Plain HTTP only here (no ws:true) -- WS upgrades for /tag are handled by
-// proxyTagWebSocket below instead, via a raw socket pipe. http-proxy-
-// middleware's own WS handling corrupts every frame under this exact setup
-// (confirmed live: connecting straight to relay-server works fine, but any
-// connection through this middleware's ws:true path fails immediately with
-// "Invalid WebSocket frame: RSV1 must be clear" -- with no compression
-// extension even negotiated in the handshake, so it isn't a permessage-
-// deflate issue, just something mechanically wrong in how it pipes frames).
 const tagRelayProxy = createProxyMiddleware({
   target: TAG_RELAY_TARGET,
   changeOrigin: true,
@@ -572,13 +587,11 @@ const tagRelayProxy = createProxyMiddleware({
 // prefix on each incoming request and rewrites every absolute link/
 // fetch/WebSocket URL/cookie Path it emits to match, so it keeps working
 // identically whether reached here or directly on its own port -- see
-// detectPrefix() in dev-panel.js. ws:true because the panel's terminal
-// tab is a real WebSocket (xterm.js), same as temutalk's own tab.
+// detectPrefix() in dev-panel.js.
 const devPanelProxy = createProxyMiddleware({
   target: DEV_PANEL_TARGET,
   changeOrigin: true,
   secure: false,
-  ws: true,
   logLevel: 'warn',
 });
 
