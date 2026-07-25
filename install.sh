@@ -2338,11 +2338,12 @@ start_tag_relay() {
   else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
 }
 
-# Not part of do_start()'s unconditional chain (see do_start() below) --
-# this is a distributed RL training coordinator (ai_training/learner.py),
-# opt-in via `install.sh start tag-trainer` until real headroom on
-# whatever machine hosts it is confirmed, not something every machine
-# running this stack should start automatically.
+# A distributed RL training coordinator (ai_training/learner.py) -- now in
+# do_start()'s unconditional chain (see below), meant to run continuously
+# and survive a reboot, not just be manually opt-in. Started with only a
+# small --local-envs share of the work (see TAG_TRAINER_LOCAL_ENVS) since
+# real headroom on whatever machine hosts this was confirmed with that
+# small a share, not proven safe at a much larger one.
 start_tag_trainer() {
   if proc_running tag-trainer; then warn "tag AI trainer already running."; return; fi
   local python_bin; python_bin=$(find_python)
@@ -2360,9 +2361,16 @@ start_tag_trainer() {
     warn "no trained model checkpoint under tag/ai_training/models/ -- upload one (e.g. npc_v1.zip) before starting the trainer."
     return
   fi
+  # --publish-weights writes the currently-training policy to relay-server's
+  # data dir every checkpoint -- GET /api/ai/policy-weights (server.js)
+  # serves that straight to game clients, which is what actually closes the
+  # loop from "the pool trained a bit more" to "bots in a live match got a
+  # bit better" without a new game release. tag-relay and tag-trainer run
+  # on the same host, so this is a plain shared file path, no network push.
   ( cd "$DIR/tag/ai_training" && \
     nohup "$python_bin" -u learner.py --port "$TAG_TRAINER_PORT" --local-envs "$TAG_TRAINER_LOCAL_ENVS" \
       --resume "$resume_from" --out "$DIR/tag/ai_training/models/pooled" \
+      --publish-weights "$DIR/tag/relay-server/data/ai_policy_weights.json" \
       >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-trainer)" )
   sleep 2
   if proc_running tag-trainer; then ok "tag AI trainer started (PID $(proc_pid tag-trainer)) → :$TAG_TRAINER_PORT, resumed from $(basename "$resume_from")"
@@ -2909,7 +2917,7 @@ do_start() {
   if ! { [ -s "$DIR/.bin/$cf_bin_name" ] && "$DIR/.bin/$cf_bin_name" --version >/dev/null 2>&1; }; then
     ensure_portable_cloudflared
   fi
-  start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
+  start_forge; start_tag_relay; start_tag_trainer; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
 do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc tag-trainer; stop_proc forge; }
 
