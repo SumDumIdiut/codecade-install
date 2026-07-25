@@ -1646,7 +1646,7 @@ function selectDevice(id){
     var pct=t.durationMs?Math.min(100,(t.progressMs||0)/t.durationMs*100).toFixed(1):0;
     h+='<div class="det-card"><div class="det-title">Now Playing</div>';
     h+='<div class="alb-row">';
-    h+=t.albumArt?'<img class="alb-img" src="'+esc(t.albumArt)+'" onerror="this.style.display=\\'none\\'">':'<div class="alb-img"></div>';
+    h+=t.albumArt?'<img class="alb-img" src="'+esc(t.albumArt)+'" onerror="this.style.display=\'none\'">':'<div class="alb-img"></div>';
     h+='<div><div class="t-name">'+esc(t.name)+'</div><div class="t-sub">'+esc(t.artists||'')+'</div><div class="t-sub">'+esc(t.album||'')+'</div></div></div>';
     h+='<div class="prog"><div class="prog-f" style="width:'+pct+'%"></div></div>';
     h+='<div class="det-row"><span class="det-k">State</span><span>'+(p.isPlaying?'<span class="pill pg">&#9654; Playing</span>':'<span class="pill pn">Paused</span>')+'</span></div>';
