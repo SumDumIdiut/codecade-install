@@ -44,6 +44,14 @@ TEMUTALK_PORT="${TEMUTALK_PORT:-3001}"
 FORGE_PORT="${FORGE_PORT:-3000}"
 TAG_RELAY_PORT="${TAG_RELAY_PORT:-3002}"
 DEV_PANEL_PORT="${DEV_PANEL_PORT:-9091}"
+TAG_TRAINER_PORT="${TAG_TRAINER_PORT:-8770}"
+TAG_TRAINER_LOCAL_ENVS="${TAG_TRAINER_LOCAL_ENVS:-4}"
+# ai_training's Python venv deliberately does NOT live under $DIR (the
+# bundled USB drive) -- confirmed live on terraserver that it's exFAT,
+# which doesn't support symlinks, and Debian/Ubuntu's python3-venv creates
+# one (lib64 -> lib) unconditionally regardless of --copies. $HOME is a
+# real filesystem on every machine this runs on, unlike the portable drive.
+TAG_TRAINER_VENV="${TAG_TRAINER_VENV:-$HOME/tag-trainer-venv}"
 
 # Runs a git command against a repo dir that might live on a filesystem
 # without ownership tracking (FAT/exFAT USB drives, common for the bundled
@@ -405,6 +413,16 @@ find_node() {
 find_npm() {
   [ -s "$DIR/.bin/npm" ] && { echo "$DIR/.bin/npm"; return; }
   command -v npm 2>/dev/null
+}
+# No portable-download fallback here (unlike find_node/find_npm) --
+# getting a prebuilt CPU torch wheel + venv right automatically across
+# machines is more failure-prone than it's worth; ai_training/README.md's
+# pooled-training section documents the one-time manual venv setup
+# (python3 -m venv "$TAG_TRAINER_VENV" && pip install -r requirements.txt)
+# this looks for.
+find_python() {
+  [ -s "$TAG_TRAINER_VENV/bin/python" ] && { echo "$TAG_TRAINER_VENV/bin/python"; return; }
+  command -v python3 2>/dev/null
 }
 # Old name kept as an alias -- temutalk used to bundle its own separate
 # portable Node before the download was generalized to the whole stack.
@@ -2222,6 +2240,37 @@ start_tag_relay() {
   else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
 }
 
+# Not part of do_start()'s unconditional chain (see do_start() below) --
+# this is a distributed RL training coordinator (ai_training/learner.py),
+# opt-in via `install.sh start tag-trainer` until real headroom on
+# whatever machine hosts it is confirmed, not something every machine
+# running this stack should start automatically.
+start_tag_trainer() {
+  if proc_running tag-trainer; then warn "tag AI trainer already running."; return; fi
+  local python_bin; python_bin=$(find_python)
+  if [ -z "$python_bin" ]; then
+    warn "no Python venv found for the AI trainer at $TAG_TRAINER_VENV -- see ai_training/README.md's pooled-training section (one-time manual venv + pip install, not provisioned by setup)."
+    return
+  fi
+  # Resumes from whatever the pool has already trained if a prior run
+  # left a checkpoint, falling back to the original baseline only on a
+  # genuinely first-ever start -- otherwise every restart would silently
+  # throw away all pooled training progress since the baseline.
+  local resume_from="$DIR/tag/ai_training/models/pooled.zip"
+  [ -f "$resume_from" ] || resume_from="$DIR/tag/ai_training/models/npc_v1.zip"
+  if [ ! -f "$resume_from" ]; then
+    warn "no trained model checkpoint under tag/ai_training/models/ -- upload one (e.g. npc_v1.zip) before starting the trainer."
+    return
+  fi
+  ( cd "$DIR/tag/ai_training" && \
+    nohup "$python_bin" -u learner.py --port "$TAG_TRAINER_PORT" --local-envs "$TAG_TRAINER_LOCAL_ENVS" \
+      --resume "$resume_from" --out "$DIR/tag/ai_training/models/pooled" \
+      >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-trainer)" )
+  sleep 2
+  if proc_running tag-trainer; then ok "tag AI trainer started (PID $(proc_pid tag-trainer)) → :$TAG_TRAINER_PORT, resumed from $(basename "$resume_from")"
+  else snapshot_log_on_failure "tag-trainer-start" "$DIR/service.log"; fi
+}
+
 # Token-authenticated exec/file-transfer service -- an SSH replacement for
 # when direct SSH access to this machine is unreliable (see remote-admin.js
 # for the actual endpoints and the auth model). Binds to 127.0.0.1 only by
@@ -2764,10 +2813,10 @@ do_start() {
   fi
   start_forge; start_tag_relay; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
-do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc forge; }
+do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc tag-trainer; stop_proc forge; }
 
 status_json() {
-  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false remote_admin_run=false
+  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false remote_admin_run=false tag_trainer_run=false
   proc_running forge         && forge_run=true
   proc_running temutalk      && temutalk_run=true
   proc_running portal        && portal_run=true
@@ -2775,8 +2824,20 @@ status_json() {
   proc_running tag-relay     && tag_relay_run=true
   proc_running dev-panel     && dev_panel_run=true
   proc_running remote-admin  && remote_admin_run=true
-  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"remoteAdmin":%s,"url":"https://%s"}\n' \
-    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$remote_admin_run" "$CF_DOMAIN"
+  # A Python process can hold its port while its venv is subtly broken in
+  # a way none of the other (Node) services here are prone to -- unlike
+  # them, "the port is bound" alone isn't good evidence tag-trainer is
+  # actually iterating, so this queries its own /status for a real
+  # round_id instead of just checking proc_running. "null" if it's not
+  # running or didn't answer in time.
+  local tag_trainer_status="null"
+  if proc_running tag-trainer; then
+    tag_trainer_run=true
+    local ts_json; ts_json=$(curl -s --max-time 2 "http://127.0.0.1:$TAG_TRAINER_PORT/status" 2>/dev/null)
+    [ -n "$ts_json" ] && tag_trainer_status="$ts_json"
+  fi
+  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"remoteAdmin":%s,"tagTrainer":%s,"tagTrainerStatus":%s,"url":"https://%s"}\n' \
+    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$remote_admin_run" "$tag_trainer_run" "$tag_trainer_status" "$CF_DOMAIN"
 }
 
 do_open_browser() {
@@ -2844,8 +2905,9 @@ do_check_updates() {
   read -rp "  Restart affected services to apply? [Y/n] " yn
   if [[ ! "$yn" =~ ^[Nn]$ ]]; then
     [ "$changed_forge" -eq 1 ]    && proc_running forge     && { stop_proc forge;     start_forge; }
-    [ "$changed_tag" -eq 1 ]      && proc_running tag-relay && { stop_proc tag-relay; start_tag_relay; }
-    [ "$changed_temutalk" -eq 1 ] && proc_running temutalk  && { stop_proc temutalk;  start_temutalk; }
+    [ "$changed_tag" -eq 1 ]      && proc_running tag-relay   && { stop_proc tag-relay;   start_tag_relay; }
+    [ "$changed_tag" -eq 1 ]      && proc_running tag-trainer && { stop_proc tag-trainer; start_tag_trainer; }
+    [ "$changed_temutalk" -eq 1 ] && proc_running temutalk    && { stop_proc temutalk;    start_temutalk; }
     ok "Restarted affected services."
   fi
   _updates_available=0
@@ -2875,8 +2937,8 @@ if [ "${1:-}" = "setup" ]; then clear_logs; do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
 if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   case "${2:-}" in
-    forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|all) ;;
-    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|all}"; exit 1 ;;
+    forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|all) ;;
+    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|all}"; exit 1 ;;
   esac
   case "$1-$2" in
     start-forge)         start_forge ;;
@@ -2886,6 +2948,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     start-tag-relay)     start_tag_relay ;;
     start-dev-panel)     start_dev_panel ;;
     start-remote-admin)  start_remote_admin ;;
+    start-tag-trainer)   start_tag_trainer ;;
     start-all)           do_start ;;
     stop-forge)          stop_proc forge ;;
     stop-temutalk)       stop_proc temutalk ;;
@@ -2894,6 +2957,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     stop-tag-relay)      stop_proc tag-relay ;;
     stop-dev-panel)      stop_proc dev-panel ;;
     stop-remote-admin)   stop_proc remote-admin ;;
+    stop-tag-trainer)    stop_proc tag-trainer ;;
     stop-all)            do_stop ;;
   esac
   exit 0
@@ -2935,6 +2999,7 @@ SERVICES_LABELS=(
   "Toggle Tag relay"
   "Toggle Dev panel"
   "Toggle Remote-admin"
+  "Toggle AI trainer"
 )
 DIAGNOSTICS_LABELS=(
   "Check for updates"
@@ -3023,6 +3088,7 @@ menu() {
     print_status_row "Tunnel"    tunnel
     print_status_row "Dev panel" dev-panel
     print_status_row "Admin"     remote-admin
+    print_status_row "AI trainer" tag-trainer
     echo "  ${C_DIM}URL${C_RESET}          https://${CF_DOMAIN}"
 
     if [ "$_updates_available" -eq 1 ]; then
@@ -3126,6 +3192,7 @@ menu() {
           4) if proc_running tag-relay;    then stop_proc tag-relay;    else start_tag_relay;    fi ;;
           5) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
           6) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
+          7) if proc_running tag-trainer;  then stop_proc tag-trainer;  else start_tag_trainer;  fi ;;
         esac
         ;;
       2) # DIAGNOSTICS
