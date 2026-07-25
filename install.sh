@@ -542,31 +542,48 @@ const app = express();
 // http-proxy-middleware preserves the mount prefix (/temutalk, /forge, /tag)
 // in the proxied request by default — each backend is BASE_PATH-aware and
 // expects it.
-// None of the four proxies below set ws:true, even temutalk's and dev-
-// panel's, which DO need real WebSocket support (xterm.js terminals, live
-// chat). All four get their WS upgrades from the SAME explicit,
-// path-filtered server.on('upgrade', ...) dispatcher below instead
+// All four proxies get their WS upgrades from the SAME explicit,
+// path-filtered server.on('upgrade', ...) dispatcher below
 // (temutalkProxy.upgrade(...)/devPanelProxy.upgrade(...) called by hand
 // for their own prefixes, proxyTagWebSocket's raw pipe for /tag).
-// Confirmed live (raw byte capture against production) that /tag WS
-// connections were failing with TWO concatenated "101 Switching
-// Protocols" responses back-to-back, the second immediately followed by
-// http-proxy-middleware's own "Error occurred while trying to proxy: ..."
-// text -- that exact string doesn't exist anywhere in this codebase, so
-// it can only be the library itself attempting (and failing) to proxy an
-// upgrade it was never explicitly routed. The leading suspect: ws:true
-// is documented (http-proxy-middleware GH issues) to make the library
-// internally self-attach its OWN additional upgrade listener straight
-// onto the shared http.Server, independent of and unfiltered by Express's
-// app.use(path, ...) routing -- so a temutalkProxy/devPanelProxy with
-// ws:true set could plausibly grab upgrade requests meant for /tag too,
-// racing the correct explicit dispatcher below. Not independently
-// reproduced in an isolated local harness (same 2x-ws:true shape came
-// back clean), so treat the mechanism as the best available explanation
-// rather than fully proven -- but it's also unneeded regardless: the
-// explicit .upgrade() calls below already do the real WS work for all
-// four mounts, so removing it here is safe either way.
-const temutalkProxy = createProxyMiddleware({
+//
+// temutalkProxy/devPanelProxy are constructed with an explicit path
+// context as createProxyMiddleware()'s FIRST argument ('/temutalk',
+// '/panel') rather than the options-only form -- this isn't cosmetic.
+// Read straight from the installed http-proxy-middleware@2.0.10 source
+// (config-factory.js's isContextless()): calling createProxyMiddleware()
+// with only an options object (no context) makes the library default
+// config.context to '/', i.e. "matches every path" -- app.use(path, ...)
+// only scopes *Express's own* regular-request routing, it's invisible to
+// the proxy's internal WS bookkeeping. That default is what broke
+// production: with ws:true set (as it originally was here) the proxy
+// self-subscribes an UNFILTERED server.on('upgrade', ...) listener the
+// first time a normal request passes through it (this.wsInternalSubscribed
+// in the source), which then matched (and mis-proxied) /tag's own upgrade
+// requests too -- confirmed live via a raw byte capture showing TWO
+// concatenated "101 Switching Protocols" responses back-to-back, the
+// second immediately followed by http-proxy-middleware's own "Error
+// occurred while trying to proxy: ..." text (that exact string doesn't
+// exist anywhere in this codebase, so it can only be the library itself).
+// Simply removing ws:true (a since-reverted first attempt at this fix)
+// stopped that, but broke temutalk/dev-panel's OWN legitimate WS traffic
+// in the process: the library's exposed .upgrade() method (what our own
+// dispatcher calls below) is ITSELF gated behind
+// `if (!this.wsInternalSubscribed)` -- a "don't double-handle" guard --
+// so whenever ws:true's auto-subscribe had already fired, our explicit
+// .upgrade() calls for these two proxies were silent no-ops the whole
+// time; the auto-subscribed (unfiltered) listener was quietly doing all
+// the real work. Removing ws:true left NEITHER path functioning. The
+// actual fix is the context argument: shouldProxy() -- used by both the
+// auto-subscribe path and the manual .upgrade() path -- checks the
+// request's URL against config.context via a plain prefix match
+// (context-matcher.js's matchSingleStringPath: pathname.indexOf(context)
+// === 0), so an explicit '/temutalk'/'/panel' context makes each proxy
+// correctly ignore upgrade requests for other mounts regardless of which
+// internal path handles them, and ws:true can stay off (matching the
+// other two proxies) since the explicit dispatcher's .upgrade() calls now
+// genuinely do the work instead of no-op'ing.
+const temutalkProxy = createProxyMiddleware('/temutalk', {
   target: TEMUTALK_TARGET,
   changeOrigin: true,
   secure: false, // temutalk's TLS cert is self-signed
@@ -588,7 +605,7 @@ const tagRelayProxy = createProxyMiddleware({
 // fetch/WebSocket URL/cookie Path it emits to match, so it keeps working
 // identically whether reached here or directly on its own port -- see
 // detectPrefix() in dev-panel.js.
-const devPanelProxy = createProxyMiddleware({
+const devPanelProxy = createProxyMiddleware('/panel', {
   target: DEV_PANEL_TARGET,
   changeOrigin: true,
   secure: false,
