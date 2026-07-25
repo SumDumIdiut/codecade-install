@@ -743,6 +743,7 @@ const TEMUTALK_RUN_DIR     = path.join(TEMUTALK_DIR, '.run');
 const TEMUTALK_ENV_FILE    = path.join(TEMUTALK_DIR, '.env');
 const KEY_HASH_FILE        = process.env.TEMUTALK_KEY_HASH_FILE || path.join(TEMUTALK_RUN_DIR, 'panel-key-hash');
 const TEMUTALK_SERVER_PORT = parseInt(process.env.TEMUTALK_SERVER_PORT || '3001', 10);
+const TAG_TRAINER_PORT = parseInt(process.env.TAG_TRAINER_PORT || '8770', 10);
 const RUN_DIR = path.join(__dirname, '.run');
 
 // Reachable two ways at once with this same running process: directly on
@@ -858,6 +859,24 @@ function callServerJson(urlPath, method = 'GET', body = null) {
   });
 }
 function fetchServerJson(urlPath) { return callServerJson(urlPath); }
+
+// tag-trainer (ai_training/learner.py) is plain HTTP, not temutalk's
+// self-signed HTTPS -- separate helper rather than a flag on
+// callServerJson, since the http/https modules aren't interchangeable
+// (different agent, no rejectUnauthorized concern here at all).
+function callTrainerJson(urlPath, method = 'GET') {
+  return new Promise(resolve => {
+    const opts = { hostname: '127.0.0.1', port: TAG_TRAINER_PORT, path: urlPath, method };
+    const req = http.request(opts, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(d) }); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 function sendJson(res, status, body) {
@@ -1149,6 +1168,7 @@ details summary:hover{color:var(--tx)}
 <nav class="tabbar" id="main-tabbar">
   <button class="tab on" data-maintab="terminal" onclick="switchMainTab('terminal')">&gt;_ Terminal</button>
   <button class="tab"    data-maintab="temutalk" onclick="switchMainTab('temutalk')">&#9654; TemuTalk</button>
+  <button class="tab"    data-maintab="ai-training" onclick="switchMainTab('ai-training')">&#129302; AI Training</button>
 </nav>
 
 <!-- Terminal pane -->
@@ -1261,6 +1281,30 @@ details summary:hover{color:var(--tx)}
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- AI Training pane: status + toggle for ai_training/learner.py, proxied
+     through this same panel's existing auth (see callTrainerJson() /
+     the /api/ai-training/* routes in handleRequest()) -->
+<div class="mainpane" id="pane-ai-training">
+  <header class="hdr">
+    <div class="hdr-logo">AI Training</div>
+  </header>
+  <div style="padding:16px;max-width:720px">
+    <div id="ait-summary" style="margin-bottom:16px;font-size:14px">Loading&hellip;</div>
+    <table style="width:100%;border-collapse:collapse;font-size:13px">
+      <thead>
+        <tr style="text-align:left;opacity:.7">
+          <th style="padding:4px 8px">Worker</th>
+          <th style="padding:4px 8px">Envs</th>
+          <th style="padding:4px 8px">Last seen</th>
+          <th style="padding:4px 8px">Dedicating</th>
+          <th style="padding:4px 8px"></th>
+        </tr>
+      </thead>
+      <tbody id="ait-workers-body"></tbody>
+    </table>
   </div>
 </div>
 
@@ -1820,13 +1864,50 @@ function spyMsg(m){
   }
 }
 
-// ── Boot -- both tabs run in the background regardless of which is active,
+// ── AI Training tab ───────────────────────────────────────────────────────────
+async function aitRefresh(){
+  var summary=document.getElementById('ait-summary'), body=document.getElementById('ait-workers-body');
+  var res;
+  try{res=await fetch(PREFIX+'/api/ai-training/status');}catch(e){summary.textContent='Trainer not reachable.';body.innerHTML='';return;}
+  if(!res.ok){summary.textContent='Trainer not reachable.';body.innerHTML='';return;}
+  var data=await res.json();
+  if(!data||!data.running||!data.status){
+    summary.textContent='AI trainer is not running.';
+    body.innerHTML='';
+    return;
+  }
+  var s=data.status;
+  summary.innerHTML='Round <b>'+esc(String(s.round_id))+'</b> &middot; '+Number(s.num_timesteps||0).toLocaleString()+' timesteps trained';
+  var workers=s.workers||{};
+  var ids=Object.keys(workers);
+  if(ids.length===0){body.innerHTML='<tr><td colspan="5" style="padding:8px;opacity:.6">No workers connected yet.</td></tr>';return;}
+  body.innerHTML=ids.map(function(id){
+    var w=workers[id];
+    var ago=Math.max(0,Math.round(Date.now()/1000-w.last_seen));
+    var ded=!!w.dedicate;
+    return '<tr style="border-top:1px solid rgba(255,255,255,.08)">'+
+      '<td style="padding:6px 8px;font-family:monospace">'+esc(id.slice(0,8))+'&hellip;</td>'+
+      '<td style="padding:6px 8px">'+esc(String(w.envs))+'</td>'+
+      '<td style="padding:6px 8px">'+ago+'s ago</td>'+
+      '<td style="padding:6px 8px">'+(ded?'Yes':'No')+'</td>'+
+      '<td style="padding:6px 8px"><button class="abtn" onclick="aitToggle(\''+esc(id)+'\','+(!ded)+')">'+(ded?'Stop':'Dedicate')+'</button></td>'+
+    '</tr>';
+  }).join('');
+}
+async function aitToggle(workerId,on){
+  await fetch(PREFIX+'/api/ai-training/dedicate?worker_id='+encodeURIComponent(workerId)+'&on='+on,{method:'POST'});
+  aitRefresh();
+}
+
+// ── Boot -- all tabs run in the background regardless of which is active,
 // same as the original two panels did in isolation ────────────────────────────
 initTerm();
 renderRooms();
 refreshAdmin();
 setInterval(refreshAdmin,4000);
 spyConnect();
+aitRefresh();
+setInterval(aitRefresh,4000);
 </script>
 </body>
 </html>`;
@@ -1928,6 +2009,23 @@ async function handleRequest(req, res) {
 
   if (!isAuthed(req)) { sendJson(res, 401, { error: 'Not authenticated' }); return; }
   refreshSession(req, res, prefix);
+
+  // ── AI Training tab: proxied to ai_training/learner.py's own local HTTP
+  // API (plain HTTP on 127.0.0.1, not exposed beyond this process) --
+  // isAuthed() above is the only auth gate the toggle needs, same as
+  // every other panel action here.
+  if (req.method === 'GET' && url.pathname === '/api/ai-training/status') {
+    const result = await callTrainerJson('/status');
+    sendJson(res, 200, { running: !!result, status: result ? result.body : null });
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/ai-training/dedicate') {
+    const workerId = url.searchParams.get('worker_id') || '';
+    const on = url.searchParams.get('on') === 'true';
+    const result = await callTrainerJson(`/dedicate?worker_id=${encodeURIComponent(workerId)}&on=${on}`, 'POST');
+    sendJson(res, result ? result.status : 502, result ? result.body : { error: 'trainer unreachable' });
+    return;
+  }
 
   // ── TemuTalk tab: proxied to temutalk's own server ──────────────────────────
   if (req.method === 'GET' && url.pathname === '/api/admin') {
@@ -2692,7 +2790,7 @@ start_dev_panel() {
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
-    TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
+    TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" TAG_TRAINER_PORT="$TAG_TRAINER_PORT" \
     nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
   sleep 1
   if proc_running dev-panel; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
