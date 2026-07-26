@@ -52,6 +52,14 @@ TAG_TRAINER_LOCAL_ENVS="${TAG_TRAINER_LOCAL_ENVS:-4}"
 # one (lib64 -> lib) unconditionally regardless of --copies. $HOME is a
 # real filesystem on every machine this runs on, unlike the portable drive.
 TAG_TRAINER_VENV="${TAG_TRAINER_VENV:-$HOME/tag-trainer-venv}"
+# A local worker (ai_training/worker.py) contributing rollout compute to
+# the SAME host's own tag-trainer learner, on top of the learner's own
+# --local-envs share -- worthwhile whenever other contributing machines
+# (e.g. a gaming PC) aren't always on, so the pool still gets meaningful
+# throughput between their sessions. Kept modest relative to a dedicated
+# contributor's envs count since this host also runs every other service
+# in this stack on the same handful of CPU cores.
+TAG_WORKER_ENVS="${TAG_WORKER_ENVS:-96}"
 
 # Runs a git command against a repo dir that might live on a filesystem
 # without ownership tracking (FAT/exFAT USB drives, common for the bundled
@@ -2409,6 +2417,29 @@ start_tag_trainer() {
   else snapshot_log_on_failure "tag-trainer-start" "$DIR/service.log"; fi
 }
 
+# A worker (ai_training/worker.py) that contributes rollout compute to the
+# SAME host's own tag-trainer learner over its local HTTP API -- pure
+# extra throughput, no separate model/checkpoint of its own, and no port
+# to expose (it's a client, not a server). Registers with the learner
+# under its own worker_id (cached in ai_training/.worker_id) and starts
+# out un-dedicated like any other worker; toggle it on from the dev
+# panel's AI Training tab or `curl -X POST .../dedicate?worker_id=...&on=true`.
+start_tag_worker() {
+  if proc_running tag-worker; then warn "tag AI worker already running."; return; fi
+  if ! proc_running tag-trainer; then warn "tag-trainer isn't running -- start it first, the worker has nothing to poll without it."; return; fi
+  local python_bin; python_bin=$(find_python)
+  if [ -z "$python_bin" ]; then
+    warn "no Python venv found for the AI worker at $TAG_TRAINER_VENV -- see ai_training/README.md's pooled-training section."
+    return
+  fi
+  ( cd "$DIR/tag/ai_training" && \
+    nohup "$python_bin" -u worker.py --learner "http://127.0.0.1:$TAG_TRAINER_PORT" --envs "$TAG_WORKER_ENVS" --poll-interval 2.0 \
+      >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-worker)" )
+  sleep 2
+  if proc_running tag-worker; then ok "tag AI worker started (PID $(proc_pid tag-worker)) → contributing $TAG_WORKER_ENVS envs to :$TAG_TRAINER_PORT"
+  else snapshot_log_on_failure "tag-worker-start" "$DIR/service.log"; fi
+}
+
 # Token-authenticated exec/file-transfer service -- an SSH replacement for
 # when direct SSH access to this machine is unreliable (see remote-admin.js
 # for the actual endpoints and the auth model). Binds to 127.0.0.1 only by
@@ -2949,12 +2980,12 @@ do_start() {
   if ! { [ -s "$DIR/.bin/$cf_bin_name" ] && "$DIR/.bin/$cf_bin_name" --version >/dev/null 2>&1; }; then
     ensure_portable_cloudflared
   fi
-  start_forge; start_tag_relay; start_tag_trainer; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
+  start_forge; start_tag_relay; start_tag_trainer; start_tag_worker; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
-do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-relay; stop_proc tag-trainer; stop_proc forge; }
+do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-worker; stop_proc tag-trainer; stop_proc forge; }
 
 status_json() {
-  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false remote_admin_run=false tag_trainer_run=false
+  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dev_panel_run=false remote_admin_run=false tag_trainer_run=false tag_worker_run=false
   proc_running forge         && forge_run=true
   proc_running temutalk      && temutalk_run=true
   proc_running portal        && portal_run=true
@@ -2962,6 +2993,7 @@ status_json() {
   proc_running tag-relay     && tag_relay_run=true
   proc_running dev-panel     && dev_panel_run=true
   proc_running remote-admin  && remote_admin_run=true
+  proc_running tag-worker    && tag_worker_run=true
   # A Python process can hold its port while its venv is subtly broken in
   # a way none of the other (Node) services here are prone to -- unlike
   # them, "the port is bound" alone isn't good evidence tag-trainer is
@@ -2974,8 +3006,8 @@ status_json() {
     local ts_json; ts_json=$(curl -s --max-time 2 "http://127.0.0.1:$TAG_TRAINER_PORT/status" 2>/dev/null)
     [ -n "$ts_json" ] && tag_trainer_status="$ts_json"
   fi
-  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"remoteAdmin":%s,"tagTrainer":%s,"tagTrainerStatus":%s,"url":"https://%s"}\n' \
-    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$remote_admin_run" "$tag_trainer_run" "$tag_trainer_status" "$CF_DOMAIN"
+  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"devPanel":%s,"remoteAdmin":%s,"tagTrainer":%s,"tagTrainerStatus":%s,"tagWorker":%s,"url":"https://%s"}\n' \
+    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dev_panel_run" "$remote_admin_run" "$tag_trainer_run" "$tag_trainer_status" "$tag_worker_run" "$CF_DOMAIN"
 }
 
 do_open_browser() {
@@ -3045,6 +3077,7 @@ do_check_updates() {
     [ "$changed_forge" -eq 1 ]    && proc_running forge     && { stop_proc forge;     start_forge; }
     [ "$changed_tag" -eq 1 ]      && proc_running tag-relay   && { stop_proc tag-relay;   start_tag_relay; }
     [ "$changed_tag" -eq 1 ]      && proc_running tag-trainer && { stop_proc tag-trainer; start_tag_trainer; }
+    [ "$changed_tag" -eq 1 ]      && proc_running tag-worker  && { stop_proc tag-worker;  start_tag_worker;  }
     [ "$changed_temutalk" -eq 1 ] && proc_running temutalk    && { stop_proc temutalk;    start_temutalk; }
     ok "Restarted affected services."
   fi
@@ -3075,8 +3108,8 @@ if [ "${1:-}" = "setup" ]; then clear_logs; do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
 if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   case "${2:-}" in
-    forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|all) ;;
-    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|all}"; exit 1 ;;
+    forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|tag-worker|all) ;;
+    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dev-panel|remote-admin|tag-trainer|tag-worker|all}"; exit 1 ;;
   esac
   case "$1-$2" in
     start-forge)         start_forge ;;
@@ -3087,6 +3120,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     start-dev-panel)     start_dev_panel ;;
     start-remote-admin)  start_remote_admin ;;
     start-tag-trainer)   start_tag_trainer ;;
+    start-tag-worker)    start_tag_worker ;;
     start-all)           do_start ;;
     stop-forge)          stop_proc forge ;;
     stop-temutalk)       stop_proc temutalk ;;
@@ -3096,6 +3130,7 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     stop-dev-panel)      stop_proc dev-panel ;;
     stop-remote-admin)   stop_proc remote-admin ;;
     stop-tag-trainer)    stop_proc tag-trainer ;;
+    stop-tag-worker)     stop_proc tag-worker ;;
     stop-all)            do_stop ;;
   esac
   exit 0
@@ -3138,6 +3173,7 @@ SERVICES_LABELS=(
   "Toggle Dev panel"
   "Toggle Remote-admin"
   "Toggle AI trainer"
+  "Toggle AI worker"
 )
 DIAGNOSTICS_LABELS=(
   "Check for updates"
@@ -3227,6 +3263,7 @@ menu() {
     print_status_row "Dev panel" dev-panel
     print_status_row "Admin"     remote-admin
     print_status_row "AI trainer" tag-trainer
+    print_status_row "AI worker"  tag-worker
     echo "  ${C_DIM}URL${C_RESET}          https://${CF_DOMAIN}"
 
     if [ "$_updates_available" -eq 1 ]; then
@@ -3331,6 +3368,7 @@ menu() {
           5) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
           6) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
           7) if proc_running tag-trainer;  then stop_proc tag-trainer;  else start_tag_trainer;  fi ;;
+          8) if proc_running tag-worker;   then stop_proc tag-worker;   else start_tag_worker;   fi ;;
         esac
         ;;
       2) # DIAGNOSTICS
