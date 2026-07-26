@@ -1028,6 +1028,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
    touching the outer Terminal/TemuTalk panes. */
 .mainpane{display:none;flex:1;overflow:hidden;flex-direction:column}
 .mainpane.on{display:flex}
+#tt-panes{flex:1;overflow:hidden;display:flex;flex-direction:column}
 .pane{display:none;flex:1;overflow:hidden;flex-direction:column}
 .pane.on{display:flex}
 
@@ -1132,6 +1133,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .tdot.on{background:var(--grn)}
 .tstat{font-size:12px;color:var(--sec)}
 #terminal-wrap{flex:1;overflow:hidden}
+#terminal{height:100%;width:100%}
 
 /* Accounts */
 .accs-body{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:16px}
@@ -1461,7 +1463,7 @@ function renderRooms(){
       var last=msgs[msgs.length-1];
       var badge=unread.get(id)||0;
       var sel=curRoom===id;
-      h+='<div class="r-item'+(sel?' on':'')+'" onclick="selectRoom(\''+esc(id)+'\')">';
+      h+='<div class="r-item'+(sel?' on':'')+'" onclick="selectRoom(\\''+esc(id)+'\\')">';
       h+='<div class="r-av">'+avHtml(r.name||id,null)+'<div class="r-type-badge">'+roomIcon(r.type||'dm')+'</div></div>';
       h+='<div class="r-inf">';
       h+='<div class="r-name">'+esc(r.name||id)+'</div>';
@@ -1530,10 +1532,10 @@ function buildMsgRow(m){
   var isAdmin=m.from==='panel-bot'||m.isPanelMsg;
   var av=isAdmin
     ?'<div class="r-av" style="background:rgba(210,153,34,.15);color:#d29922">&#128226;</div>'
-    :'<button class="m-av-btn" onclick="pmOpen(\''+esc((m.fromName||'').toLowerCase())+'\')"><div class="r-av">'+avHtml(m.fromName,m.avatarUrl)+'</div></button>';
+    :'<button class="m-av-btn" onclick="pmOpen(\\''+esc((m.fromName||'').toLowerCase())+'\\')"><div class="r-av">'+avHtml(m.fromName,m.avatarUrl)+'</div></button>';
   var sender=isAdmin
     ?'<span class="m-sender-name admin-label">Server <span style="font-size:10px;background:rgba(210,153,34,.15);color:#d29922;border-radius:3px;padding:1px 5px">ADMIN</span></span>'
-    :'<button class="m-sender-name" onclick="pmOpen(\''+esc((m.fromName||'').toLowerCase())+'\')">'+esc(m.fromName||'Unknown')+'</button>';
+    :'<button class="m-sender-name" onclick="pmOpen(\\''+esc((m.fromName||'').toLowerCase())+'\\')">'+esc(m.fromName||'Unknown')+'</button>';
   var bubbleCls='bubble'+(isAdmin?' admin':'');
   return '<div class="m-row">'+av+'<div class="m-bubble-col">'+sender
     +'<span class="'+bubbleCls+'">'+esc(m.text||'')+'<span class="m-time">'+fmtTime(m.ts)+'</span></span>'
@@ -1608,7 +1610,7 @@ function renderDeviceList(){
     var track=d.player&&d.player.track;
     var sub=d.radio?'&#128191; '+esc(d.radio.name||'Radio'):track?'&#9654; '+esc(track.name):'Connected';
     var sel=curDevice===d.deviceId;
-    h+='<div class="dev-card'+(sel?' on':'')+'" onclick="selectDevice(\''+esc(d.deviceId)+'\')">';
+    h+='<div class="dev-card'+(sel?' on':'')+'" onclick="selectDevice(\\''+esc(d.deviceId)+'\\')">';
     h+='<div class="dev-av"><span>'+ini(name)+'</span><div class="dev-dot"></div></div>';
     h+='<div class="dev-inf"><div class="dev-name">'+esc(name)+'</div>';
     h+='<div class="dev-sub">'+sub+'</div>';
@@ -1646,7 +1648,7 @@ function selectDevice(id){
     var pct=t.durationMs?Math.min(100,(t.progressMs||0)/t.durationMs*100).toFixed(1):0;
     h+='<div class="det-card"><div class="det-title">Now Playing</div>';
     h+='<div class="alb-row">';
-    h+=t.albumArt?'<img class="alb-img" src="'+esc(t.albumArt)+'" onerror="this.style.display=\'none\'">':'<div class="alb-img"></div>';
+    h+=t.albumArt?'<img class="alb-img" src="'+esc(t.albumArt)+'" onerror="this.style.display=\\'none\\'">':'<div class="alb-img"></div>';
     h+='<div><div class="t-name">'+esc(t.name)+'</div><div class="t-sub">'+esc(t.artists||'')+'</div><div class="t-sub">'+esc(t.album||'')+'</div></div></div>';
     h+='<div class="prog"><div class="prog-f" style="width:'+pct+'%"></div></div>';
     h+='<div class="det-row"><span class="det-k">State</span><span>'+(p.isPlaying?'<span class="pill pg">&#9654; Playing</span>':'<span class="pill pn">Paused</span>')+'</span></div>';
@@ -1708,7 +1710,7 @@ function renderAccounts(){
     h+='<div class="acc-item">';
     h+='<div class="acc-av">'+avHtml(a.name,a.avatarUrl)+'</div>';
     h+='<div style="flex:1;min-width:0"><div class="acc-name">'+esc(a.name)+'</div><div class="acc-key">'+esc(a.key)+'</div></div>';
-    h+='<button class="abtn" onclick="pmOpen(\''+esc(a.key)+'\')">&#9998; Edit</button>';
+    h+='<button class="abtn" onclick="pmOpen(\\''+esc(a.key)+'\\')">&#9998; Edit</button>';
     h+='</div>';
   });
   el.innerHTML=h;
@@ -1722,7 +1724,7 @@ function renderGroups(groups){
     h+='<div class="acc-item">';
     h+='<div class="acc-av" style="font-size:.9rem">&#128101;</div>';
     h+='<div style="flex:1;min-width:0"><div class="acc-name">'+esc(g.name)+'</div><div class="acc-key">'+g.memberCount+' member'+(g.memberCount!==1?'s':'')+'</div></div>';
-    h+='<button class="abtn danger" onclick="deleteGroup(\''+esc(g.id)+'\')">&#128465;</button>';
+    h+='<button class="abtn danger" onclick="deleteGroup(\\''+esc(g.id)+'\\')">&#128465;</button>';
     h+='</div>';
   });
   el.innerHTML=h;
@@ -1750,7 +1752,7 @@ async function loadTestReqs(){
       h+='<div class="acc-item" style="padding:8px 10px"><div class="acc-av" style="width:26px;height:26px">'
         +(req.avatarUrl?'<img src="'+esc(req.avatarUrl)+'" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">':'<span>'+ini(req.name)+'</span>')
         +'</div><div style="flex:1;min-width:0"><div class="acc-name">'+esc(req.name)+'</div></div>'
-        +'<button class="abtn" onclick="testAcceptReq(\''+esc(req.id)+'\')">Accept</button></div>';
+        +'<button class="abtn" onclick="testAcceptReq(\\''+esc(req.id)+'\\')">Accept</button></div>';
     });
     el.innerHTML=h;
   }catch(e){}
@@ -1920,7 +1922,7 @@ async function aitRefresh(){
       '<td style="padding:6px 8px">'+esc(String(w.envs))+'</td>'+
       '<td style="padding:6px 8px">'+ago+'s ago</td>'+
       '<td style="padding:6px 8px">'+(ded?'Yes':'No')+'</td>'+
-      '<td style="padding:6px 8px"><button class="abtn" onclick="aitToggle(\''+esc(id)+'\','+(!ded)+')">'+(ded?'Stop':'Dedicate')+'</button></td>'+
+      '<td style="padding:6px 8px"><button class="abtn" onclick="aitToggle(\\''+esc(id)+'\\','+(!ded)+')">'+(ded?'Stop':'Dedicate')+'</button></td>'+
     '</tr>';
   }).join('');
 }
