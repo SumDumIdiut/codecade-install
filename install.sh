@@ -1917,7 +1917,7 @@ async function aitRefresh(){
     return;
   }
   var s=data.status;
-  summary.innerHTML='Round <b>'+esc(String(s.round_id))+'</b> &middot; '+Number(s.num_timesteps||0).toLocaleString()+' timesteps trained';
+  summary.innerHTML='Round <b>'+esc(String(s.round_id))+'</b> &middot; '+Number(s.num_timesteps||0).toLocaleString()+' timesteps trained &middot; '+Number(s.total_episodes||0).toLocaleString()+' games played';
   var workers=s.workers||{};
   var ids=Object.keys(workers);
   if(ids.length===0){body.innerHTML='<tr><td colspan="5" style="padding:8px;opacity:.6">No workers connected yet.</td></tr>';return;}
