@@ -59,7 +59,7 @@ TAG_TRAINER_VENV="${TAG_TRAINER_VENV:-$HOME/tag-trainer-venv}"
 # throughput between their sessions. Kept modest relative to a dedicated
 # contributor's envs count since this host also runs every other service
 # in this stack on the same handful of CPU cores.
-TAG_WORKER_ENVS="${TAG_WORKER_ENVS:-96}"
+TAG_WORKER_ENVS="${TAG_WORKER_ENVS:-84}"
 
 # Runs a git command against a repo dir that might live on a filesystem
 # without ownership tracking (FAT/exFAT USB drives, common for the bundled
