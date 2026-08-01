@@ -2371,8 +2371,17 @@ start_tag_relay() {
   if [ ! -d "$DIR/tag/relay-server/node_modules" ]; then warn "tag/relay-server/node_modules missing — run setup first."; return; fi
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/tag/relay-server" && BASE_PATH=/tag PORT="$TAG_RELAY_PORT" \
-    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
+  # Optional secrets (TURN_KEY_ID/TURN_API_TOKEN for /api/webrtc/turn-credentials,
+  # same idea as .asset_publish_key.sh above it) -- kept as a plain untracked
+  # dotfile directly in tag/relay-server/ rather than $HOME, so everything
+  # this service needs stays contained to the portable USB drive instead of
+  # spread across the two. Sourced best-effort: relay-server.js itself
+  # already degrades gracefully (503 on the TURN endpoint specifically) if
+  # these are missing, so a server without this file still starts fine.
+  ( cd "$DIR/tag/relay-server" || exit 1
+    [ -f ".tag_relay_secrets.sh" ] && . ".tag_relay_secrets.sh"
+    BASE_PATH=/tag PORT="$TAG_RELAY_PORT" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
   sleep 1
   if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
   else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
