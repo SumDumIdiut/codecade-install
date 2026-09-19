@@ -98,6 +98,22 @@ err()  {
   printf '[%s] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >> "$DIR/error.log" 2>/dev/null
 }
 
+# ─── Refuse to run as root ──────────────────────────────────────────────────
+# Nothing here needs root -- every tool is a portable download under
+# $DIR/.bin and every service is a plain user-level process. Running under
+# sudo instead breaks $HOME-relative paths (TAG_TRAINER_VENV resolves to
+# /root/tag-trainer-venv, which doesn't exist, so find_python() silently
+# falls back to a system python3 missing every pinned dependency -- confirmed
+# live as a "ModuleNotFoundError: No module named 'stable_baselines3'" crash
+# loop) and leaves every spawned process root-owned, which a later non-sudo
+# stop/start can't see as running or kill -- confirmed live: those processes
+# squat on their ports forever and every subsequent start crashes with
+# EADDRINUSE against their own unmanageable earlier selves.
+if [ "$(id -u 2>/dev/null)" = "0" ] && [ -z "${CODECADE_ALLOW_ROOT:-}" ]; then
+  err "Don't run this with sudo — run it as the normal user instead (bash install.sh). Root breaks \$HOME-relative paths (e.g. the tag-trainer venv) and leaves root-owned processes a later non-root stop/start can't manage. Set CODECADE_ALLOW_ROOT=1 to override."
+  exit 1
+fi
+
 # ─── Self-update ──────────────────────────────────────────────────────────
 # Runs before anything else on every startup (interactive or CLI dispatch)
 # so this is always the latest version, whether it's a real clone of
@@ -555,6 +571,25 @@ free_port() {
       break
     fi
   done
+}
+
+# Confirms a just-started service is both alive AND (when it binds a port)
+# actually listening -- proc_running() alone can't distinguish a genuinely
+# healthy process from one about to die asynchronously (an EADDRINUSE thrown
+# from Node's 'error' event fires after the process already exists and
+# passes an immediate kill -0 check -- confirmed live: a start reported
+# success this way, then crashed moments later while still holding a stale
+# "started" pidfile). Polls briefly instead of one fixed sleep so a
+# slow-starting service isn't falsely reported as failed.
+confirm_started() {
+  local name="$1" port="${2:-}" waited=0
+  while [ "$waited" -lt 20 ]; do
+    proc_running "$name" || return 1
+    { [ -z "$port" ] || port_listening "$port"; } && return 0
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  proc_running "$name" && { [ -z "$port" ] || port_listening "$port"; }
 }
 
 # ─── Portal (no repo of its own — install.sh is the source of truth) ────────
@@ -2612,8 +2647,7 @@ start_forge() {
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/git-forge" && BASE_PATH=/forge PORT="$FORGE_PORT" \
     nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file forge)" )
-  sleep 1
-  if proc_running forge; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
+  if confirm_started forge "$FORGE_PORT"; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
   else snapshot_log_on_failure "forge-start" "$DIR/service.log"; fi
 }
 
@@ -2643,8 +2677,7 @@ start_tag_relay() {
     [ -f ".asset_publish_key.sh" ] && . ".asset_publish_key.sh"
     BASE_PATH=/tag PORT="$TAG_RELAY_PORT" ASSET_PUBLISH_KEY="$ASSET_PUBLISH_KEY" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
     echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
-  sleep 1
-  if proc_running tag-relay; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
+  if confirm_started tag-relay "$TAG_RELAY_PORT"; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
   else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
 }
 
@@ -2657,8 +2690,7 @@ start_dotnet_relay() {
   ( cd "$DIR/dotnet/server" || exit 1
     PORT="$DOTNET_RELAY_PORT" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
     echo "$(detect_os):$!" > "$(pid_file dotnet-relay)" )
-  sleep 1
-  if proc_running dotnet-relay; then ok "DOTnet relay started (PID $(proc_pid dotnet-relay)) → :$DOTNET_RELAY_PORT"
+  if confirm_started dotnet-relay "$DOTNET_RELAY_PORT"; then ok "DOTnet relay started (PID $(proc_pid dotnet-relay)) → :$DOTNET_RELAY_PORT"
   else snapshot_log_on_failure "dotnet-relay-start" "$DIR/service.log"; fi
 }
 
@@ -2697,8 +2729,7 @@ start_tag_trainer() {
       --resume "$resume_from" --out "$DIR/tag/ai_training/models/pooled" \
       --publish-weights "$DIR/tag/relay-server/data/ai_policy_weights.json" \
       >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-trainer)" )
-  sleep 2
-  if proc_running tag-trainer; then ok "tag AI trainer started (PID $(proc_pid tag-trainer)) → :$TAG_TRAINER_PORT, resumed from $(basename "$resume_from")"
+  if confirm_started tag-trainer "$TAG_TRAINER_PORT"; then ok "tag AI trainer started (PID $(proc_pid tag-trainer)) → :$TAG_TRAINER_PORT, resumed from $(basename "$resume_from")"
   else snapshot_log_on_failure "tag-trainer-start" "$DIR/service.log"; fi
 }
 
@@ -2738,8 +2769,7 @@ start_remote_admin() {
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/remote-admin" && \
     nohup "$node_bin" remote-admin.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
-  sleep 1
-  if proc_running remote-admin; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
+  if confirm_started remote-admin "3099"; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
   else snapshot_log_on_failure "remote-admin-start" "$DIR/service.log"; fi
 }
 
@@ -3151,8 +3181,7 @@ start_dev_panel() {
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
     TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" TAG_TRAINER_PORT="$TAG_TRAINER_PORT" \
     nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
-  sleep 1
-  if proc_running dev-panel; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
+  if confirm_started dev-panel "$DEV_PANEL_PORT"; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
   else snapshot_log_on_failure "dev-panel-start" "$DIR/service.log"; fi
 }
 
@@ -3164,8 +3193,7 @@ start_temutalk() {
   if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
   ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
     nohup "$node_bin" launcher.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file temutalk)" )
-  sleep 2
-  if proc_running temutalk; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
+  if confirm_started temutalk "$TEMUTALK_PORT"; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
   else snapshot_log_on_failure "temutalk-start" "$DIR/service.log"; fi
 }
 
@@ -3180,8 +3208,7 @@ start_recharge_hub() {
   # never living in this script.
   ( cd "$DIR/recharge-hub" && PORT="$RECHARGE_HUB_PORT" \
     nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file recharge-hub)" )
-  sleep 1
-  if proc_running recharge-hub; then ok "recharge-hub started (PID $(proc_pid recharge-hub)) → :$RECHARGE_HUB_PORT"
+  if confirm_started recharge-hub "$RECHARGE_HUB_PORT"; then ok "recharge-hub started (PID $(proc_pid recharge-hub)) → :$RECHARGE_HUB_PORT"
   else snapshot_log_on_failure "recharge-hub-start" "$DIR/service.log"; fi
 }
 
@@ -3195,8 +3222,7 @@ start_portal() {
     TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" DOTNET_RELAY_TARGET="http://127.0.0.1:$DOTNET_RELAY_PORT" \
     RECHARGE_HUB_TARGET="http://127.0.0.1:$RECHARGE_HUB_PORT" DEV_PANEL_TARGET="https://127.0.0.1:$DEV_PANEL_PORT" \
     nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
-  sleep 1
-  if proc_running portal; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
+  if confirm_started portal "$PORTAL_PORT"; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
   else snapshot_log_on_failure "portal-start" "$DIR/service.log"; fi
 }
 
@@ -3490,6 +3516,7 @@ SERVICES_LABELS=(
   "Toggle Tunnel"
   "Toggle Tag relay"
   "Toggle DOTnet relay"
+  "Toggle Recharge Hub"
   "Toggle Dev panel"
   "Toggle Remote-admin"
   "Toggle AI trainer"
@@ -3581,6 +3608,7 @@ menu() {
     print_status_row "TemuTalk"  temutalk
     print_status_row "Portal"    portal
     print_status_row "Tunnel"    tunnel
+    print_status_row "Recharge"  recharge-hub
     print_status_row "Dev panel" dev-panel
     print_status_row "Admin"     remote-admin
     print_status_row "AI trainer" tag-trainer
@@ -3686,11 +3714,12 @@ menu() {
           2) if proc_running portal;       then stop_proc portal;       else start_portal;       fi ;;
           3) if proc_running tunnel;       then stop_proc tunnel;       else start_tunnel;       fi ;;
           4) if proc_running tag-relay;    then stop_proc tag-relay;    else start_tag_relay;    fi ;;
-          5) if proc_running dotnet-relay; then stop_proc dotnet-relay; else start_dotnet_relay;  fi ;;
-          6) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
-          7) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
-          8) if proc_running tag-trainer;  then stop_proc tag-trainer;  else start_tag_trainer;  fi ;;
-          9) if proc_running tag-worker;   then stop_proc tag-worker;   else start_tag_worker;   fi ;;
+          5) if proc_running dotnet-relay;  then stop_proc dotnet-relay;  else start_dotnet_relay;  fi ;;
+          6) if proc_running recharge-hub; then stop_proc recharge-hub; else start_recharge_hub; fi ;;
+          7) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
+          8) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
+          9) if proc_running tag-trainer;  then stop_proc tag-trainer;  else start_tag_trainer;  fi ;;
+          10) if proc_running tag-worker;   then stop_proc tag-worker;   else start_tag_worker;   fi ;;
         esac
         ;;
       2) # DIAGNOSTICS
