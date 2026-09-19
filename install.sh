@@ -47,22 +47,6 @@ TAG_RELAY_PORT="${TAG_RELAY_PORT:-3002}"
 DOTNET_RELAY_PORT="${DOTNET_RELAY_PORT:-7777}"
 RECHARGE_HUB_PORT="${RECHARGE_HUB_PORT:-3010}"
 DEV_PANEL_PORT="${DEV_PANEL_PORT:-9091}"
-TAG_TRAINER_PORT="${TAG_TRAINER_PORT:-8770}"
-TAG_TRAINER_LOCAL_ENVS="${TAG_TRAINER_LOCAL_ENVS:-4}"
-# ai_training's Python venv deliberately does NOT live under $DIR (the
-# bundled USB drive) -- confirmed live on terraserver that it's exFAT,
-# which doesn't support symlinks, and Debian/Ubuntu's python3-venv creates
-# one (lib64 -> lib) unconditionally regardless of --copies. $HOME is a
-# real filesystem on every machine this runs on, unlike the portable drive.
-TAG_TRAINER_VENV="${TAG_TRAINER_VENV:-$HOME/tag-trainer-venv}"
-# A local worker (ai_training/worker.py) contributing rollout compute to
-# the SAME host's own tag-trainer learner, on top of the learner's own
-# --local-envs share -- worthwhile whenever other contributing machines
-# (e.g. a gaming PC) aren't always on, so the pool still gets meaningful
-# throughput between their sessions. Kept modest relative to a dedicated
-# contributor's envs count since this host also runs every other service
-# in this stack on the same handful of CPU cores.
-TAG_WORKER_ENVS="${TAG_WORKER_ENVS:-84}"
 
 # Runs a git command against a repo dir that might live on a filesystem
 # without ownership tracking (FAT/exFAT USB drives, common for the bundled
@@ -101,16 +85,16 @@ err()  {
 # ─── Refuse to run as root ──────────────────────────────────────────────────
 # Nothing here needs root -- every tool is a portable download under
 # $DIR/.bin and every service is a plain user-level process. Running under
-# sudo instead breaks $HOME-relative paths (TAG_TRAINER_VENV resolves to
-# /root/tag-trainer-venv, which doesn't exist, so find_python() silently
-# falls back to a system python3 missing every pinned dependency -- confirmed
-# live as a "ModuleNotFoundError: No module named 'stable_baselines3'" crash
-# loop) and leaves every spawned process root-owned, which a later non-sudo
-# stop/start can't see as running or kill -- confirmed live: those processes
-# squat on their ports forever and every subsequent start crashes with
-# EADDRINUSE against their own unmanageable earlier selves.
+# sudo instead breaks $HOME-relative paths (confirmed live: a Python venv
+# path resolved under /root instead of the real user's $HOME, so the venv
+# lookup silently missed it and fell back to a system interpreter missing
+# every pinned dependency) and leaves every spawned process root-owned,
+# which a later non-sudo stop/start can't see as running or kill --
+# confirmed live: those processes squat on their ports forever and every
+# subsequent start crashes with EADDRINUSE against their own unmanageable
+# earlier selves.
 if [ "$(id -u 2>/dev/null)" = "0" ] && [ -z "${CODECADE_ALLOW_ROOT:-}" ]; then
-  err "Don't run this with sudo — run it as the normal user instead (bash install.sh). Root breaks \$HOME-relative paths (e.g. the tag-trainer venv) and leaves root-owned processes a later non-root stop/start can't manage. Set CODECADE_ALLOW_ROOT=1 to override."
+  err "Don't run this with sudo — run it as the normal user instead (bash install.sh). Root breaks \$HOME-relative paths and leaves root-owned processes a later non-root stop/start can't manage. Set CODECADE_ALLOW_ROOT=1 to override."
   exit 1
 fi
 
@@ -440,16 +424,6 @@ find_node() {
 find_npm() {
   [ -s "$DIR/.bin/npm" ] && { echo "$DIR/.bin/npm"; return; }
   command -v npm 2>/dev/null
-}
-# No portable-download fallback here (unlike find_node/find_npm) --
-# getting a prebuilt CPU torch wheel + venv right automatically across
-# machines is more failure-prone than it's worth; ai_training/README.md's
-# pooled-training section documents the one-time manual venv setup
-# (python3 -m venv "$TAG_TRAINER_VENV" && pip install -r requirements.txt)
-# this looks for.
-find_python() {
-  [ -s "$TAG_TRAINER_VENV/bin/python" ] && { echo "$TAG_TRAINER_VENV/bin/python"; return; }
-  command -v python3 2>/dev/null
 }
 # Old name kept as an alias -- temutalk used to bundle its own separate
 # portable Node before the download was generalized to the whole stack.
@@ -1049,7 +1023,6 @@ const TEMUTALK_RUN_DIR     = path.join(TEMUTALK_DIR, '.run');
 const TEMUTALK_ENV_FILE    = path.join(TEMUTALK_DIR, '.env');
 const KEY_HASH_FILE        = process.env.TEMUTALK_KEY_HASH_FILE || path.join(TEMUTALK_RUN_DIR, 'panel-key-hash');
 const TEMUTALK_SERVER_PORT = parseInt(process.env.TEMUTALK_SERVER_PORT || '3001', 10);
-const TAG_TRAINER_PORT = parseInt(process.env.TAG_TRAINER_PORT || '8770', 10);
 const RUN_DIR = path.join(__dirname, '.run');
 
 // Reachable two ways at once with this same running process: directly on
@@ -1165,24 +1138,6 @@ function callServerJson(urlPath, method = 'GET', body = null) {
   });
 }
 function fetchServerJson(urlPath) { return callServerJson(urlPath); }
-
-// tag-trainer (ai_training/learner.py) is plain HTTP, not temutalk's
-// self-signed HTTPS -- separate helper rather than a flag on
-// callServerJson, since the http/https modules aren't interchangeable
-// (different agent, no rejectUnauthorized concern here at all).
-function callTrainerJson(urlPath, method = 'GET') {
-  return new Promise(resolve => {
-    const opts = { hostname: '127.0.0.1', port: TAG_TRAINER_PORT, path: urlPath, method };
-    const req = http.request(opts, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => { try { resolve({ status: res.statusCode, body: JSON.parse(d) }); } catch { resolve(null); } });
-    });
-    req.on('error', () => resolve(null));
-    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-    req.end();
-  });
-}
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 function sendJson(res, status, body) {
@@ -1476,7 +1431,6 @@ details summary:hover{color:var(--tx)}
 <nav class="tabbar" id="main-tabbar">
   <button class="tab on" data-maintab="terminal" onclick="switchMainTab('terminal')">&gt;_ Terminal</button>
   <button class="tab"    data-maintab="temutalk" onclick="switchMainTab('temutalk')">&#9654; TemuTalk</button>
-  <button class="tab"    data-maintab="ai-training" onclick="switchMainTab('ai-training')">&#129302; AI Training</button>
 </nav>
 
 <!-- Terminal pane -->
@@ -1589,30 +1543,6 @@ details summary:hover{color:var(--tx)}
         </div>
       </div>
     </div>
-  </div>
-</div>
-
-<!-- AI Training pane: status + toggle for ai_training/learner.py, proxied
-     through this same panel's existing auth (see callTrainerJson() /
-     the /api/ai-training/* routes in handleRequest()) -->
-<div class="mainpane" id="pane-ai-training">
-  <header class="hdr">
-    <div class="hdr-logo">AI Training</div>
-  </header>
-  <div style="padding:16px;max-width:720px">
-    <div id="ait-summary" style="margin-bottom:16px;font-size:14px">Loading&hellip;</div>
-    <table style="width:100%;border-collapse:collapse;font-size:13px">
-      <thead>
-        <tr style="text-align:left;opacity:.7">
-          <th style="padding:4px 8px">Worker</th>
-          <th style="padding:4px 8px">Envs</th>
-          <th style="padding:4px 8px">Last seen</th>
-          <th style="padding:4px 8px">Dedicating</th>
-          <th style="padding:4px 8px"></th>
-        </tr>
-      </thead>
-      <tbody id="ait-workers-body"></tbody>
-    </table>
   </div>
 </div>
 
@@ -2172,41 +2102,6 @@ function spyMsg(m){
   }
 }
 
-// ── AI Training tab ───────────────────────────────────────────────────────────
-async function aitRefresh(){
-  var summary=document.getElementById('ait-summary'), body=document.getElementById('ait-workers-body');
-  var res;
-  try{res=await fetch(PREFIX+'/api/ai-training/status');}catch(e){summary.textContent='Trainer not reachable.';body.innerHTML='';return;}
-  if(!res.ok){summary.textContent='Trainer not reachable.';body.innerHTML='';return;}
-  var data=await res.json();
-  if(!data||!data.running||!data.status){
-    summary.textContent='AI trainer is not running.';
-    body.innerHTML='';
-    return;
-  }
-  var s=data.status;
-  summary.innerHTML='Round <b>'+esc(String(s.round_id))+'</b> &middot; '+Number(s.num_timesteps||0).toLocaleString()+' timesteps trained &middot; '+Number(s.total_episodes||0).toLocaleString()+' games played';
-  var workers=s.workers||{};
-  var ids=Object.keys(workers);
-  if(ids.length===0){body.innerHTML='<tr><td colspan="5" style="padding:8px;opacity:.6">No workers connected yet.</td></tr>';return;}
-  body.innerHTML=ids.map(function(id){
-    var w=workers[id];
-    var ago=Math.max(0,Math.round(Date.now()/1000-w.last_seen));
-    var ded=!!w.dedicate;
-    return '<tr style="border-top:1px solid rgba(255,255,255,.08)">'+
-      '<td style="padding:6px 8px;font-family:monospace">'+esc(id.slice(0,8))+'&hellip;</td>'+
-      '<td style="padding:6px 8px">'+esc(String(w.envs))+'</td>'+
-      '<td style="padding:6px 8px">'+ago+'s ago</td>'+
-      '<td style="padding:6px 8px">'+(ded?'Yes':'No')+'</td>'+
-      '<td style="padding:6px 8px"><button class="abtn" onclick="aitToggle(\\''+esc(id)+'\\','+(!ded)+')">'+(ded?'Stop':'Dedicate')+'</button></td>'+
-    '</tr>';
-  }).join('');
-}
-async function aitToggle(workerId,on){
-  await fetch(PREFIX+'/api/ai-training/dedicate?worker_id='+encodeURIComponent(workerId)+'&on='+on,{method:'POST'});
-  aitRefresh();
-}
-
 // ── Boot -- all tabs run in the background regardless of which is active,
 // same as the original two panels did in isolation ────────────────────────────
 initTerm();
@@ -2214,8 +2109,6 @@ renderRooms();
 refreshAdmin();
 setInterval(refreshAdmin,4000);
 spyConnect();
-aitRefresh();
-setInterval(aitRefresh,4000);
 </script>
 </body>
 </html>`;
@@ -2317,23 +2210,6 @@ async function handleRequest(req, res) {
 
   if (!isAuthed(req)) { sendJson(res, 401, { error: 'Not authenticated' }); return; }
   refreshSession(req, res, prefix);
-
-  // ── AI Training tab: proxied to ai_training/learner.py's own local HTTP
-  // API (plain HTTP on 127.0.0.1, not exposed beyond this process) --
-  // isAuthed() above is the only auth gate the toggle needs, same as
-  // every other panel action here.
-  if (req.method === 'GET' && url.pathname === '/api/ai-training/status') {
-    const result = await callTrainerJson('/status');
-    sendJson(res, 200, { running: !!result, status: result ? result.body : null });
-    return;
-  }
-  if (req.method === 'POST' && url.pathname === '/api/ai-training/dedicate') {
-    const workerId = url.searchParams.get('worker_id') || '';
-    const on = url.searchParams.get('on') === 'true';
-    const result = await callTrainerJson(`/dedicate?worker_id=${encodeURIComponent(workerId)}&on=${on}`, 'POST');
-    sendJson(res, result ? result.status : 502, result ? result.body : { error: 'trainer unreachable' });
-    return;
-  }
 
   // ── TemuTalk tab: proxied to temutalk's own server ──────────────────────────
   if (req.method === 'GET' && url.pathname === '/api/admin') {
@@ -2692,68 +2568,6 @@ start_dotnet_relay() {
     echo "$(detect_os):$!" > "$(pid_file dotnet-relay)" )
   if confirm_started dotnet-relay "$DOTNET_RELAY_PORT"; then ok "DOTnet relay started (PID $(proc_pid dotnet-relay)) → :$DOTNET_RELAY_PORT"
   else snapshot_log_on_failure "dotnet-relay-start" "$DIR/service.log"; fi
-}
-
-# A distributed RL training coordinator (ai_training/learner.py) -- now in
-# do_start()'s unconditional chain (see below), meant to run continuously
-# and survive a reboot, not just be manually opt-in. Started with only a
-# small --local-envs share of the work (see TAG_TRAINER_LOCAL_ENVS) since
-# real headroom on whatever machine hosts this was confirmed with that
-# small a share, not proven safe at a much larger one.
-start_tag_trainer() {
-  if proc_running tag-trainer; then warn "tag AI trainer already running."; return; fi
-  free_port "$TAG_TRAINER_PORT"
-  local python_bin; python_bin=$(find_python)
-  if [ -z "$python_bin" ]; then
-    warn "no Python venv found for the AI trainer at $TAG_TRAINER_VENV -- see ai_training/README.md's pooled-training section (one-time manual venv + pip install, not provisioned by setup)."
-    return
-  fi
-  # Resumes from whatever the pool has already trained if a prior run
-  # left a checkpoint, falling back to the original baseline only on a
-  # genuinely first-ever start -- otherwise every restart would silently
-  # throw away all pooled training progress since the baseline.
-  local resume_from="$DIR/tag/ai_training/models/pooled.zip"
-  [ -f "$resume_from" ] || resume_from="$DIR/tag/ai_training/models/npc_v1.zip"
-  if [ ! -f "$resume_from" ]; then
-    warn "no trained model checkpoint under tag/ai_training/models/ -- upload one (e.g. npc_v1.zip) before starting the trainer."
-    return
-  fi
-  # --publish-weights writes the currently-training policy to relay-server's
-  # data dir every checkpoint -- GET /api/ai/policy-weights (server.js)
-  # serves that straight to game clients, which is what actually closes the
-  # loop from "the pool trained a bit more" to "bots in a live match got a
-  # bit better" without a new game release. tag-relay and tag-trainer run
-  # on the same host, so this is a plain shared file path, no network push.
-  ( cd "$DIR/tag/ai_training" && \
-    nohup "$python_bin" -u learner.py --port "$TAG_TRAINER_PORT" --local-envs "$TAG_TRAINER_LOCAL_ENVS" \
-      --resume "$resume_from" --out "$DIR/tag/ai_training/models/pooled" \
-      --publish-weights "$DIR/tag/relay-server/data/ai_policy_weights.json" \
-      >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-trainer)" )
-  if confirm_started tag-trainer "$TAG_TRAINER_PORT"; then ok "tag AI trainer started (PID $(proc_pid tag-trainer)) → :$TAG_TRAINER_PORT, resumed from $(basename "$resume_from")"
-  else snapshot_log_on_failure "tag-trainer-start" "$DIR/service.log"; fi
-}
-
-# A worker (ai_training/worker.py) that contributes rollout compute to the
-# SAME host's own tag-trainer learner over its local HTTP API -- pure
-# extra throughput, no separate model/checkpoint of its own, and no port
-# to expose (it's a client, not a server). Registers with the learner
-# under its own worker_id (cached in ai_training/.worker_id) and starts
-# out un-dedicated like any other worker; toggle it on from the dev
-# panel's AI Training tab or `curl -X POST .../dedicate?worker_id=...&on=true`.
-start_tag_worker() {
-  if proc_running tag-worker; then warn "tag AI worker already running."; return; fi
-  if ! proc_running tag-trainer; then warn "tag-trainer isn't running -- start it first, the worker has nothing to poll without it."; return; fi
-  local python_bin; python_bin=$(find_python)
-  if [ -z "$python_bin" ]; then
-    warn "no Python venv found for the AI worker at $TAG_TRAINER_VENV -- see ai_training/README.md's pooled-training section."
-    return
-  fi
-  ( cd "$DIR/tag/ai_training" && \
-    nohup "$python_bin" -u worker.py --learner "http://127.0.0.1:$TAG_TRAINER_PORT" --envs "$TAG_WORKER_ENVS" --poll-interval 2.0 \
-      >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file tag-worker)" )
-  sleep 2
-  if proc_running tag-worker; then ok "tag AI worker started (PID $(proc_pid tag-worker)) → contributing $TAG_WORKER_ENVS envs to :$TAG_TRAINER_PORT"
-  else snapshot_log_on_failure "tag-worker-start" "$DIR/service.log"; fi
 }
 
 # Token-authenticated exec/file-transfer service -- an SSH replacement for
@@ -3179,7 +2993,7 @@ start_dev_panel() {
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
-    TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" TAG_TRAINER_PORT="$TAG_TRAINER_PORT" \
+    TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
     nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
   if confirm_started dev-panel "$DEV_PANEL_PORT"; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
   else snapshot_log_on_failure "dev-panel-start" "$DIR/service.log"; fi
@@ -3313,12 +3127,12 @@ do_start() {
   if ! { [ -s "$DIR/.bin/$cf_bin_name" ] && "$DIR/.bin/$cf_bin_name" --version >/dev/null 2>&1; }; then
     ensure_portable_cloudflared
   fi
-  start_forge; start_tag_relay; start_dotnet_relay; start_recharge_hub; start_tag_trainer; start_tag_worker; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
+  start_forge; start_tag_relay; start_dotnet_relay; start_recharge_hub; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
-do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc tag-worker; stop_proc tag-trainer; stop_proc recharge-hub; stop_proc dotnet-relay; stop_proc tag-relay; stop_proc forge; }
+do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc recharge-hub; stop_proc dotnet-relay; stop_proc tag-relay; stop_proc forge; }
 
 status_json() {
-  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dotnet_relay_run=false recharge_hub_run=false dev_panel_run=false remote_admin_run=false tag_trainer_run=false tag_worker_run=false
+  local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dotnet_relay_run=false recharge_hub_run=false dev_panel_run=false remote_admin_run=false
   proc_running forge         && forge_run=true
   proc_running temutalk      && temutalk_run=true
   proc_running portal        && portal_run=true
@@ -3328,21 +3142,8 @@ status_json() {
   proc_running recharge-hub  && recharge_hub_run=true
   proc_running dev-panel     && dev_panel_run=true
   proc_running remote-admin  && remote_admin_run=true
-  proc_running tag-worker    && tag_worker_run=true
-  # A Python process can hold its port while its venv is subtly broken in
-  # a way none of the other (Node) services here are prone to -- unlike
-  # them, "the port is bound" alone isn't good evidence tag-trainer is
-  # actually iterating, so this queries its own /status for a real
-  # round_id instead of just checking proc_running. "null" if it's not
-  # running or didn't answer in time.
-  local tag_trainer_status="null"
-  if proc_running tag-trainer; then
-    tag_trainer_run=true
-    local ts_json; ts_json=$(curl -s --max-time 2 "http://127.0.0.1:$TAG_TRAINER_PORT/status" 2>/dev/null)
-    [ -n "$ts_json" ] && tag_trainer_status="$ts_json"
-  fi
-  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"dotnetRelay":%s,"rechargeHub":%s,"devPanel":%s,"remoteAdmin":%s,"tagTrainer":%s,"tagTrainerStatus":%s,"tagWorker":%s,"url":"https://%s"}\n' \
-    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dotnet_relay_run" "$recharge_hub_run" "$dev_panel_run" "$remote_admin_run" "$tag_trainer_run" "$tag_trainer_status" "$tag_worker_run" "$CF_DOMAIN"
+  printf '{"forge":%s,"temutalk":%s,"portal":%s,"tunnel":%s,"tagRelay":%s,"dotnetRelay":%s,"rechargeHub":%s,"devPanel":%s,"remoteAdmin":%s,"url":"https://%s"}\n' \
+    "$forge_run" "$temutalk_run" "$portal_run" "$tunnel_run" "$tag_relay_run" "$dotnet_relay_run" "$recharge_hub_run" "$dev_panel_run" "$remote_admin_run" "$CF_DOMAIN"
 }
 
 do_open_browser() {
@@ -3416,8 +3217,6 @@ do_check_updates() {
   if [[ ! "$yn" =~ ^[Nn]$ ]]; then
     [ "$changed_forge" -eq 1 ]       && proc_running forge        && { stop_proc forge;        start_forge; }
     [ "$changed_tag" -eq 1 ]         && proc_running tag-relay    && { stop_proc tag-relay;    start_tag_relay; }
-    [ "$changed_tag" -eq 1 ]         && proc_running tag-trainer  && { stop_proc tag-trainer;  start_tag_trainer; }
-    [ "$changed_tag" -eq 1 ]         && proc_running tag-worker   && { stop_proc tag-worker;   start_tag_worker;  }
     [ "$changed_dotnet" -eq 1 ]      && proc_running dotnet-relay && { stop_proc dotnet-relay; start_dotnet_relay; }
     [ "$changed_temutalk" -eq 1 ]    && proc_running temutalk     && { stop_proc temutalk;     start_temutalk; }
     ok "Restarted affected services."
@@ -3449,8 +3248,8 @@ if [ "${1:-}" = "setup" ]; then clear_logs; do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
 if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
   case "${2:-}" in
-    forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|tag-trainer|tag-worker|all) ;;
-    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|tag-trainer|tag-worker|all}"; exit 1 ;;
+    forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|all) ;;
+    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|all}"; exit 1 ;;
   esac
   case "$1-$2" in
     start-forge)         start_forge ;;
@@ -3462,8 +3261,6 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     start-recharge-hub)  start_recharge_hub ;;
     start-dev-panel)     start_dev_panel ;;
     start-remote-admin)  start_remote_admin ;;
-    start-tag-trainer)   start_tag_trainer ;;
-    start-tag-worker)    start_tag_worker ;;
     start-all)           do_start ;;
     stop-forge)          stop_proc forge ;;
     stop-temutalk)       stop_proc temutalk ;;
@@ -3474,8 +3271,6 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     stop-recharge-hub)   stop_proc recharge-hub ;;
     stop-dev-panel)      stop_proc dev-panel ;;
     stop-remote-admin)   stop_proc remote-admin ;;
-    stop-tag-trainer)    stop_proc tag-trainer ;;
-    stop-tag-worker)     stop_proc tag-worker ;;
     stop-all)            do_stop ;;
   esac
   exit 0
@@ -3519,8 +3314,6 @@ SERVICES_LABELS=(
   "Toggle Recharge Hub"
   "Toggle Dev panel"
   "Toggle Remote-admin"
-  "Toggle AI trainer"
-  "Toggle AI worker"
 )
 DIAGNOSTICS_LABELS=(
   "Check for updates"
@@ -3611,8 +3404,6 @@ menu() {
     print_status_row "Recharge"  recharge-hub
     print_status_row "Dev panel" dev-panel
     print_status_row "Admin"     remote-admin
-    print_status_row "AI trainer" tag-trainer
-    print_status_row "AI worker"  tag-worker
     echo "  ${C_DIM}URL${C_RESET}          https://${CF_DOMAIN}"
 
     if [ "$_updates_available" -eq 1 ]; then
@@ -3718,8 +3509,6 @@ menu() {
           6) if proc_running recharge-hub; then stop_proc recharge-hub; else start_recharge_hub; fi ;;
           7) if proc_running dev-panel;    then stop_proc dev-panel;    else start_dev_panel;    fi ;;
           8) if proc_running remote-admin; then stop_proc remote-admin; else start_remote_admin; fi ;;
-          9) if proc_running tag-trainer;  then stop_proc tag-trainer;  else start_tag_trainer;  fi ;;
-          10) if proc_running tag-worker;   then stop_proc tag-worker;   else start_tag_worker;   fi ;;
         esac
         ;;
       2) # DIAGNOSTICS
