@@ -3130,6 +3130,7 @@ do_start() {
   start_forge; start_tag_relay; start_dotnet_relay; start_recharge_hub; start_temutalk; start_portal; start_dev_panel; start_remote_admin; start_tunnel
 }
 do_stop()  { stop_proc tunnel; stop_proc remote-admin; stop_proc dev-panel; stop_proc portal; stop_proc temutalk; stop_proc recharge-hub; stop_proc dotnet-relay; stop_proc tag-relay; stop_proc forge; }
+do_restart() { do_stop; do_start; }
 
 status_json() {
   local forge_run=false temutalk_run=false portal_run=false tunnel_run=false tag_relay_run=false dotnet_relay_run=false recharge_hub_run=false dev_panel_run=false remote_admin_run=false
@@ -3246,10 +3247,10 @@ do_view_errors() {
 # ─── Non-interactive CLI dispatch ────────────────────────────────────────────
 if [ "${1:-}" = "setup" ]; then clear_logs; do_setup; exit 0; fi
 if [ "${1:-}" = "bundle" ]; then do_bundle "${2:-}"; exit 0; fi
-if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
+if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ] || [ "${1:-}" = "restart" ]; then
   case "${2:-}" in
     forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|all) ;;
-    *) err "Usage: install.sh {start|stop} {forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|all}"; exit 1 ;;
+    *) err "Usage: install.sh {start|stop|restart} {forge|temutalk|portal|tunnel|tag-relay|dotnet-relay|recharge-hub|dev-panel|remote-admin|all}"; exit 1 ;;
   esac
   case "$1-$2" in
     start-forge)         start_forge ;;
@@ -3272,6 +3273,16 @@ if [ "${1:-}" = "start" ] || [ "${1:-}" = "stop" ]; then
     stop-dev-panel)      stop_proc dev-panel ;;
     stop-remote-admin)   stop_proc remote-admin ;;
     stop-all)            do_stop ;;
+    restart-forge)        stop_proc forge;        start_forge ;;
+    restart-temutalk)     stop_proc temutalk;     start_temutalk ;;
+    restart-portal)       stop_proc portal;       start_portal ;;
+    restart-tunnel)       stop_proc tunnel;       start_tunnel ;;
+    restart-tag-relay)    stop_proc tag-relay;    start_tag_relay ;;
+    restart-dotnet-relay) stop_proc dotnet-relay; start_dotnet_relay ;;
+    restart-recharge-hub) stop_proc recharge-hub; start_recharge_hub ;;
+    restart-dev-panel)    stop_proc dev-panel;    start_dev_panel ;;
+    restart-remote-admin) stop_proc remote-admin; start_remote_admin ;;
+    restart-all)          do_restart ;;
   esac
   exit 0
 fi
@@ -3300,6 +3311,7 @@ TAB_NAMES=("CONTROL" "SERVICES" "DIAGNOSTICS")
 CONTROL_LABELS=(
   "Start all"
   "Stop all"
+  "Restart all"
   "Open in browser"
   "Bundle to a drive..."
   "Exit"
@@ -3487,12 +3499,13 @@ menu() {
         case "$_menu_selected" in
           0) do_start ;;
           1) do_stop ;;
-          2) do_open_browser ;;
-          3)
+          2) do_restart ;;
+          3) do_open_browser ;;
+          4)
             read -rp "  Destination path (e.g. a mounted USB drive): " bundle_dest
             [ -n "$bundle_dest" ] && do_bundle "$bundle_dest"
             ;;
-          4)
+          5)
             echo "  Bye."
             exit 0
             ;;
