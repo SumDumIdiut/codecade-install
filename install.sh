@@ -426,6 +426,13 @@ clone_or_update() {
 # about package.json validation to crash on node_modules that were fine
 # under the portable runtime. Silent version-mismatch fallback is worse than
 # just falling back cleanly, so this check exists specifically to catch it.
+# Every service is launched into its own session so closing the terminal
+# that started it (or a SIGHUP to that terminal's process group) can't take
+# it down -- confirmed live: services started from an xfce4-terminal window
+# all died the moment that window was closed. setsid is optional because
+# Git Bash on Windows doesn't ship it.
+SETSID=""; command -v setsid >/dev/null 2>&1 && SETSID="setsid"
+
 find_node() {
   [ -s "$DIR/.bin/node" ] && { echo "$DIR/.bin/node"; return; }
   command -v node 2>/dev/null
@@ -2530,8 +2537,10 @@ start_forge() {
   free_port "$FORGE_PORT"
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/git-forge" && BASE_PATH=/forge PORT="$FORGE_PORT" \
-    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file forge)" )
+  ( cd "$DIR/git-forge" || exit 1
+    BASE_PATH=/forge PORT="$FORGE_PORT" \
+    $SETSID nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file forge)" )
   if confirm_started forge "$FORGE_PORT"; then ok "git-forge started (PID $(proc_pid forge)) → :$FORGE_PORT"
   else snapshot_log_on_failure "forge-start" "$DIR/service.log"; fi
 }
@@ -2560,7 +2569,7 @@ start_tag_relay() {
   ( cd "$DIR/tag/relay-server" || exit 1
     [ -f ".tag_relay_secrets.sh" ] && . ".tag_relay_secrets.sh"
     [ -f ".asset_publish_key.sh" ] && . ".asset_publish_key.sh"
-    BASE_PATH=/tag PORT="$TAG_RELAY_PORT" ASSET_PUBLISH_KEY="$ASSET_PUBLISH_KEY" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    BASE_PATH=/tag PORT="$TAG_RELAY_PORT" ASSET_PUBLISH_KEY="$ASSET_PUBLISH_KEY" $SETSID nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
     echo "$(detect_os):$!" > "$(pid_file tag-relay)" )
   if confirm_started tag-relay "$TAG_RELAY_PORT"; then ok "tag relay-server started (PID $(proc_pid tag-relay)) → :$TAG_RELAY_PORT"
   else snapshot_log_on_failure "tag-relay-start" "$DIR/service.log"; fi
@@ -2573,7 +2582,7 @@ start_dotnet_relay() {
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
   ( cd "$DOTNET_RELAY_DIR" || exit 1
-    PORT="$DOTNET_RELAY_PORT" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    PORT="$DOTNET_RELAY_PORT" $SETSID nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
     echo "$(detect_os):$!" > "$(pid_file dotnet-relay)" )
   if confirm_started dotnet-relay "$DOTNET_RELAY_PORT"; then ok "DOTnet relay started (PID $(proc_pid dotnet-relay)) → :$DOTNET_RELAY_PORT"
   else snapshot_log_on_failure "dotnet-relay-start" "$DIR/service.log"; fi
@@ -2590,8 +2599,9 @@ start_remote_admin() {
   if [ ! -d "$DIR/remote-admin/node_modules" ]; then warn "remote-admin/node_modules missing — run setup first."; return; fi
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/remote-admin" && \
-    nohup "$node_bin" remote-admin.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
+  ( cd "$DIR/remote-admin" || exit 1
+    $SETSID nohup "$node_bin" remote-admin.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file remote-admin)" )
   if confirm_started remote-admin "3099"; then ok "remote-admin started (PID $(proc_pid remote-admin)) → 127.0.0.1:3099"
   else snapshot_log_on_failure "remote-admin-start" "$DIR/service.log"; fi
 }
@@ -2838,7 +2848,8 @@ ensure_temutalk_npm_deps() {
   # --no-bin-links: same reasoning as portal/git-forge/tag-relay above --
   # this runs from a portable USB drive (usually exFAT/FAT32, which can't
   # hold symlinks), and nothing here is launched via a bin script anyway.
-  if ( cd "$DIR/temutalk" && "$npm_bin" install --no-audit --no-fund --no-bin-links --loglevel=error ); then
+  if ( cd "$DIR/temutalk" || exit 1
+    "$npm_bin" install --no-audit --no-fund --no-bin-links --loglevel=error ); then
     ok "temutalk npm dependencies installed."
   else
     err "temutalk npm install failed — see output above."
@@ -3003,7 +3014,8 @@ start_dev_panel() {
   ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
     TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
-    nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
+    $SETSID nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file dev-panel)" )
   if confirm_started dev-panel "$DEV_PANEL_PORT"; then ok "Dev panel started (PID $(proc_pid dev-panel)) → :$DEV_PANEL_PORT"
   else snapshot_log_on_failure "dev-panel-start" "$DIR/service.log"; fi
 }
@@ -3014,8 +3026,10 @@ start_temutalk() {
   if [ ! -d "$DIR/temutalk/node_modules" ]; then warn "temutalk/node_modules missing — run setup first."; return; fi
   local node_bin; node_bin=$(find_temutalk_node)
   if [ -z "$node_bin" ]; then err "No Node.js binary available for temutalk."; return; fi
-  ( cd "$DIR/temutalk" && BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
-    nohup "$node_bin" launcher.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file temutalk)" )
+  ( cd "$DIR/temutalk" || exit 1
+    BASE_PATH=/temutalk EXTERNAL_TUNNEL=1 EXTERNAL_PANEL=1 PORT="$TEMUTALK_PORT" BASE_URL="https://${CF_DOMAIN}" \
+    $SETSID nohup "$node_bin" launcher.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file temutalk)" )
   if confirm_started temutalk "$TEMUTALK_PORT"; then ok "temutalk started (PID $(proc_pid temutalk)) → :$TEMUTALK_PORT"
   else snapshot_log_on_failure "temutalk-start" "$DIR/service.log"; fi
 }
@@ -3029,8 +3043,10 @@ start_recharge_hub() {
   # Discord bot token/channel/role come from recharge-hub/.env (dotenv),
   # not passed here - same reasoning as every other service's real secrets
   # never living in this script.
-  ( cd "$DIR/recharge-hub" && PORT="$RECHARGE_HUB_PORT" \
-    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file recharge-hub)" )
+  ( cd "$DIR/recharge-hub" || exit 1
+    PORT="$RECHARGE_HUB_PORT" \
+    $SETSID nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file recharge-hub)" )
   if confirm_started recharge-hub "$RECHARGE_HUB_PORT"; then ok "recharge-hub started (PID $(proc_pid recharge-hub)) → :$RECHARGE_HUB_PORT"
   else snapshot_log_on_failure "recharge-hub-start" "$DIR/service.log"; fi
 }
@@ -3040,11 +3056,13 @@ start_portal() {
   free_port "$PORTAL_PORT"
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/portal" && PORT="$PORTAL_PORT" \
+  ( cd "$DIR/portal" || exit 1
+    PORT="$PORTAL_PORT" \
     TEMUTALK_TARGET="https://127.0.0.1:$TEMUTALK_PORT" FORGE_TARGET="http://127.0.0.1:$FORGE_PORT" \
     TAG_RELAY_TARGET="http://127.0.0.1:$TAG_RELAY_PORT" DOTNET_RELAY_TARGET="http://127.0.0.1:$DOTNET_RELAY_PORT" \
     RECHARGE_HUB_TARGET="http://127.0.0.1:$RECHARGE_HUB_PORT" DEV_PANEL_TARGET="https://127.0.0.1:$DEV_PANEL_PORT" \
-    nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 & echo "$(detect_os):$!" > "$(pid_file portal)" )
+    $SETSID nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
+    echo "$(detect_os):$!" > "$(pid_file portal)" )
   if confirm_started portal "$PORTAL_PORT"; then ok "Portal started (PID $(proc_pid portal)) → :$PORTAL_PORT"
   else snapshot_log_on_failure "portal-start" "$DIR/service.log"; fi
 }
@@ -3110,7 +3128,7 @@ EOF
     [ -f "$cert_file" ] && args+=(--origincert "$(to_native_path "$cert_file")")
     args+=(--config "$(to_native_path "$_TUNNEL_CONFIG_FILE")" tunnel run)
   fi
-  nohup "$cf_bin" "${args[@]}" >> "$DIR/service.log" 2>&1 &
+  $SETSID nohup "$cf_bin" "${args[@]}" >> "$DIR/service.log" 2>&1 &
   echo "$(detect_os):$!" > "$(pid_file tunnel)"
   sleep 2
   if proc_running tunnel; then ok "Tunnel started (PID $(proc_pid tunnel)) → https://${CF_DOMAIN}"
