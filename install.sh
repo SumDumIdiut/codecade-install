@@ -2848,8 +2848,7 @@ ensure_temutalk_npm_deps() {
   # --no-bin-links: same reasoning as portal/git-forge/tag-relay above --
   # this runs from a portable USB drive (usually exFAT/FAT32, which can't
   # hold symlinks), and nothing here is launched via a bin script anyway.
-  if ( cd "$DIR/temutalk" || exit 1
-    "$npm_bin" install --no-audit --no-fund --no-bin-links --loglevel=error ); then
+  if ( cd "$DIR/temutalk" && "$npm_bin" install --no-audit --no-fund --no-bin-links --loglevel=error ); then
     ok "temutalk npm dependencies installed."
   else
     err "temutalk npm install failed — see output above."
@@ -3011,7 +3010,8 @@ start_dev_panel() {
   fi
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/portal" && DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
+  ( cd "$DIR/portal" || exit 1
+    DEV_PANEL_PORT="$DEV_PANEL_PORT" MASTER_INSTALL_SH="$DIR/install.sh" \
     TEMUTALK_DIR="$DIR/temutalk" TEMUTALK_KEY_HASH_FILE="$DIR/temutalk/.run/panel-key-hash" \
     TEMUTALK_SERVER_PORT="$TEMUTALK_PORT" \
     $SETSID nohup "$node_bin" dev-panel.js >> "$DIR/service.log" 2>&1 &
