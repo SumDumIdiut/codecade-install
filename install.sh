@@ -34,11 +34,20 @@ cd "$DIR" || exit 1
 # them automatically, without threading find_node()/find_ffmpeg() through
 # every call site individually.
 export PATH="$DIR/.bin:$PATH"
+# Every repo here is public, so git never legitimately needs credentials. A
+# repo that has been deleted or renamed makes GitHub answer 401, which git
+# turns into a "Username for github.com:" prompt that hangs the whole run
+# (confirmed live) -- fail fast instead so the caller's existing "update
+# failed, keeping current checkout" fallback takes over.
+export GIT_TERMINAL_PROMPT=0
 
 TEMUTALK_REPO="https://github.com/SumDumIdiut/temutalk.git"
 FORGE_REPO="https://github.com/SumDumIdiut/git-forge.git"
 TAG_REPO="https://github.com/SumDumIdiut/tag.git"
-DOTNET_REPO="https://github.com/SumDumIdiut/DOTnet.git"
+# The multiplayer relay now ships inside the recharge-mods repo (the old
+# standalone DOTnet repo no longer exists).
+RECHARGE_MODS_REPO="https://github.com/SumDumIdiut/recharge-mods.git"
+DOTNET_RELAY_DIR="$DIR/recharge-mods/recharge-multiplayer/server"
 CF_DOMAIN="codecade.co.za"
 PORTAL_PORT="${PORTAL_PORT:-8080}"
 TEMUTALK_PORT="${TEMUTALK_PORT:-3001}"
@@ -2389,7 +2398,7 @@ do_setup() {
   clone_or_update temutalk "$TEMUTALK_REPO" temutalk
   clone_or_update git-forge "$FORGE_REPO" git-forge
   clone_or_update tag "$TAG_REPO" tag
-  clone_or_update dotnet "$DOTNET_REPO" dotnet
+  clone_or_update recharge-mods "$RECHARGE_MODS_REPO" recharge-mods
 
   # Unlike the three apps above, the portal has no repo of its own — it's
   # thin enough (one proxy + one landing page) that install.sh just writes
@@ -2438,12 +2447,12 @@ do_setup() {
     warn "remote-admin not found — skipping."
   fi
 
-  if [ -d "$DIR/dotnet/server" ]; then
+  if [ -d "$DOTNET_RELAY_DIR" ]; then
     info "Installing dotnet-relay dependencies..."
-    run_capturing "dotnet-relay-npm-install" bash -c "cd '$DIR/dotnet/server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
+    run_capturing "dotnet-relay-npm-install" bash -c "cd '$DOTNET_RELAY_DIR' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error" \
       && ok "dotnet-relay dependencies installed."
   else
-    warn "dotnet/server not found in the dotnet repo checkout — skipping."
+    warn "recharge-mods/recharge-multiplayer/server not found in the recharge-mods checkout — skipping."
   fi
 
   if [ -d "$DIR/recharge-hub" ]; then
@@ -2477,7 +2486,7 @@ do_bundle() {
   dest="$(cd "$dest" && pwd)"
   if [ "$dest" = "$DIR" ]; then err "Destination is the same directory install.sh is already running from."; exit 1; fi
 
-  for name in temutalk git-forge tag; do
+  for name in temutalk git-forge tag recharge-mods; do
     if [ ! -d "$DIR/$name/.git" ]; then
       warn "$name isn't cloned locally yet — running setup first."
       do_setup
@@ -2491,12 +2500,12 @@ do_bundle() {
   info "Copying install.sh -> $dest/install.sh"
   cp "$DIR/install.sh" "$dest/install.sh"
 
-  # temutalk/git-forge/tag are git checkouts; portal/remote-admin/.bin aren't
-  # (portal is install.sh-generated, remote-admin lives directly in this
-  # repo, .bin is the portable Node/cloudflared/ffmpeg downloads) -- all five
-  # need to travel with the bundle for the destination to actually be
-  # self-contained, not just the three git repos.
-  for name in temutalk git-forge tag portal remote-admin .bin; do
+  # temutalk/git-forge/tag/recharge-mods are git checkouts; portal/
+  # remote-admin/recharge-hub/.bin aren't (portal is install.sh-generated,
+  # remote-admin and recharge-hub live directly in this tree, .bin is the
+  # portable Node/cloudflared/ffmpeg downloads) -- every one of them needs to
+  # travel with the bundle for the destination to actually be self-contained.
+  for name in temutalk git-forge tag recharge-mods portal remote-admin recharge-hub .bin; do
     [ -d "$DIR/$name" ] || continue
     info "Copying $name -> $dest/$name (this can take a while)..."
     if [ "$use_rsync" -eq 1 ]; then
@@ -2560,10 +2569,10 @@ start_tag_relay() {
 start_dotnet_relay() {
   if proc_running dotnet-relay; then warn "DOTnet relay already running."; return; fi
   free_port "$DOTNET_RELAY_PORT"
-  if [ ! -d "$DIR/dotnet/server/node_modules" ]; then warn "dotnet/server/node_modules missing — run setup first."; return; fi
+  if [ ! -d "$DOTNET_RELAY_DIR/node_modules" ]; then warn "$DOTNET_RELAY_DIR/node_modules missing — run setup first."; return; fi
   local node_bin; node_bin=$(find_node)
   if [ -z "$node_bin" ]; then err "node not found on PATH."; return; fi
-  ( cd "$DIR/dotnet/server" || exit 1
+  ( cd "$DOTNET_RELAY_DIR" || exit 1
     PORT="$DOTNET_RELAY_PORT" nohup "$node_bin" server.js >> "$DIR/service.log" 2>&1 &
     echo "$(detect_os):$!" > "$(pid_file dotnet-relay)" )
   if confirm_started dotnet-relay "$DOTNET_RELAY_PORT"; then ok "DOTnet relay started (PID $(proc_pid dotnet-relay)) → :$DOTNET_RELAY_PORT"
@@ -3163,11 +3172,11 @@ do_open_browser() {
 # -- previously this pulled/npm-installed/prompted-to-restart-all-three
 # unconditionally, every single time, even when nothing had changed.
 do_check_updates() {
-  info "Checking temutalk, git-forge, tag and dotnet for updates..."
+  info "Checking temutalk, git-forge, tag and recharge-mods for updates..."
   local changed_temutalk=0 changed_forge=0 changed_tag=0 changed_dotnet=0
 
   local name before
-  for name in temutalk git-forge tag dotnet; do
+  for name in temutalk git-forge tag recharge-mods; do
     before=""
     if [ -d "$DIR/$name/.git" ] && git_safe "$DIR/$name" rev-parse HEAD >/dev/null 2>&1; then
       before=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
@@ -3176,7 +3185,7 @@ do_check_updates() {
       temutalk)     clone_or_update temutalk     "$TEMUTALK_REPO"    temutalk ;;
       git-forge)    clone_or_update git-forge    "$FORGE_REPO"       git-forge ;;
       tag)          clone_or_update tag          "$TAG_REPO"         tag ;;
-      dotnet)       clone_or_update dotnet       "$DOTNET_REPO"      dotnet ;;
+      recharge-mods) clone_or_update recharge-mods "$RECHARGE_MODS_REPO" recharge-mods ;;
     esac
     local after; after=$(git_safe "$DIR/$name" rev-parse HEAD 2>/dev/null)
     # No prior HEAD (fresh clone) counts as changed too -- there's new code
@@ -3186,7 +3195,7 @@ do_check_updates() {
         temutalk)     changed_temutalk=1 ;;
         git-forge)    changed_forge=1 ;;
         tag)          changed_tag=1 ;;
-        dotnet)       changed_dotnet=1 ;;
+        recharge-mods) changed_dotnet=1 ;;
       esac
     fi
   done
@@ -3202,7 +3211,7 @@ do_check_updates() {
   [ "$changed_temutalk" -eq 1 ]    && echo "    - temutalk"
   [ "$changed_forge" -eq 1 ]       && echo "    - git-forge"
   [ "$changed_tag" -eq 1 ]         && echo "    - tag"
-  [ "$changed_dotnet" -eq 1 ]      && echo "    - dotnet"
+  [ "$changed_dotnet" -eq 1 ]      && echo "    - recharge-mods (multiplayer relay)"
 
   local npm_bin; npm_bin=$(find_npm)
   if [ -n "$npm_bin" ]; then
@@ -3210,8 +3219,8 @@ do_check_updates() {
       bash -c "cd '$DIR/git-forge' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
     [ "$changed_tag" -eq 1 ] && [ -d "$DIR/tag/relay-server" ] && run_capturing "tag-relay-npm-install" \
       bash -c "cd '$DIR/tag/relay-server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
-    [ "$changed_dotnet" -eq 1 ] && [ -d "$DIR/dotnet/server" ] && run_capturing "dotnet-relay-npm-install" \
-      bash -c "cd '$DIR/dotnet/server' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
+    [ "$changed_dotnet" -eq 1 ] && [ -d "$DOTNET_RELAY_DIR" ] && run_capturing "dotnet-relay-npm-install" \
+      bash -c "cd '$DOTNET_RELAY_DIR' && '$npm_bin' install --no-audit --no-fund --no-bin-links --loglevel=error"
   fi
 
   read -rp "  Restart affected services to apply? [Y/n] " yn
